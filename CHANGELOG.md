@@ -21,6 +21,9 @@ changes.
 - Clicking a link label no longer reveals its markup before the link opens.
   A click in another window follows the link in that window's buffer.
 
+- Extra left indentation now defaults to zero, so markdown-modern does not add
+  space on top of the user's configured window margin.
+
 ## [2.0.0] - 2026-10-09
 
 This release requires Tree-sitter. After upgrading from 1.x, run
