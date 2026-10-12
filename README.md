@@ -288,11 +288,15 @@ All options are under `M-x customize-group RET markdown-modern RET`. The faces
 | `markdown-modern-heading-use-variable-pitch` | `t` | Headings use a variable-pitch font |
 | `markdown-modern-variable-pitch` | `t` | Enable `variable-pitch-mode` (proportional prose; code/tables stay fixed-pitch) |
 | `markdown-modern-visual-line` | `t` | Enable `visual-line-mode` (soft word-wrap) |
-| `markdown-modern-left-margin` | `4` | Left margin width, in characters |
 | `markdown-modern-join-paragraph-lines` | `t` | Display single newlines in a paragraph as spaces, as Markdown renders them; `nil` = show lines as written |
 | `markdown-modern-paragraph-reveal-delay` | `nil` | Seconds the cursor rests in a paragraph before it shows its source lines; `nil` = only while you edit it |
 
 ### Reading width
+
+`markdown-modern-left-margin` defaults to `0`. It adds indentation inside the
+text area, on top of any window margin configured with `left-margin-width`.
+Leave it at zero to use your existing Emacs margins, or set it to a positive
+number for additional indentation.
 
 | Variable | Default | Description |
 |----------|---------|-------------|

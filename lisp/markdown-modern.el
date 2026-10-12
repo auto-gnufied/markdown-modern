@@ -182,9 +182,11 @@ editing shows them."
                  (number :tag "Seconds"))
   :group 'markdown-modern)
 
-(defcustom markdown-modern-left-margin 4
-  "Left margin width in characters.
-This creates whitespace on the left side of the buffer for better readability."
+(defcustom markdown-modern-left-margin 0
+  "Additional left indentation in characters.
+This uses line and wrap prefixes inside the text area, in addition to any
+window margin configured with `left-margin-width'.  The default of zero
+leaves the left spacing to your Emacs configuration."
   :type 'integer
   :group 'markdown-modern)
 
