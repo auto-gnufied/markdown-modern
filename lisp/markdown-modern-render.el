@@ -188,13 +188,15 @@
     (push ov markdown-modern-render--overlay-pool)))
 
 (defun markdown-modern-render--clear-region (start end)
-  "Clear all markdown-modern overlays in region from START to END."
+  "Clear markdown-modern overlays and URL metadata from START to END."
+  (markdown-modern-render--clear-terminal-urls start end)
   (dolist (ov (overlays-in start end))
     (when (overlay-get ov 'markdown-modern)
       (markdown-modern-render--release-overlay ov))))
 
 (defun markdown-modern-render--clear-all ()
-  "Clear all markdown-modern overlays in the buffer."
+  "Clear all markdown-modern overlays and URL metadata in the buffer."
+  (markdown-modern-render--clear-terminal-urls (point-min) (point-max))
   (dolist (ov markdown-modern-render--overlays)
     (when (overlay-buffer ov)
       (delete-overlay ov)))
@@ -564,6 +566,31 @@ When POS is nil, join the lines of every paragraph."
 
 ;;; Link and Image Rendering
 
+(defun markdown-modern-render--set-terminal-url (start end url)
+  "Attach terminal hyperlink metadata to START..END for a web URL.
+Emacs builds with OSC-8 support read the `browse-url-data' text property,
+not overlay properties.  Record ownership so re-rendering and teardown
+can remove the metadata without touching unrelated browser links."
+  (let ((case-fold-search t))
+    (when (string-match-p "\\`https?://[^/?#[:space:]]+" url)
+      (with-silent-modifications
+        (add-text-properties
+         start end (list 'browse-url-data url
+                         'markdown-modern-render--terminal-url url))))))
+
+(defun markdown-modern-render--clear-terminal-urls (start end)
+  "Remove terminal hyperlink metadata owned by this renderer in START..END."
+  (with-silent-modifications
+    (while (< start end)
+      (let ((next (next-single-property-change
+                   start 'markdown-modern-render--terminal-url nil end))
+            (url (get-text-property start 'markdown-modern-render--terminal-url)))
+        (when url
+          (remove-text-properties
+           start next '(browse-url-data nil
+                        markdown-modern-render--terminal-url nil)))
+        (setq start next)))))
+
 (defvar markdown-modern-render--link-keymap
   (let ((map (make-sparse-keymap)))
     ;; Moving point on mouse-down reveals the markup and shifts the label
@@ -601,6 +628,7 @@ When POS is nil, join the lines of every paragraph."
             (overlay-put ov 'follow-link t)
             (overlay-put ov 'markdown-modern-url url)
             (overlay-put ov 'markdown-modern-type 'link-text))
+          (markdown-modern-render--set-terminal-url text-start text-end url)
           ;; Hide ]( and URL and )
           (let ((ov (markdown-modern-render--get-overlay text-end end)))
             (overlay-put ov 'display "")
@@ -844,7 +872,8 @@ ALT-TEXT is used for the tooltip."
             (overlay-put ov 'help-echo url)
             (overlay-put ov 'markdown-modern-url url)
             (overlay-put ov 'follow-link t)
-            (overlay-put ov 'keymap markdown-modern-render--link-keymap)))))))
+            (overlay-put ov 'keymap markdown-modern-render--link-keymap))
+          (markdown-modern-render--set-terminal-url (1+ start) (1- end) url))))))
 
 ;;; Block Element Rendering
 
