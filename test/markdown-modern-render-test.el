@@ -273,6 +273,79 @@ Only the text that the edit marks for re-rendering is rendered again."
         (should-not (overlay-get reused 'follow-link))
         (should-not (overlay-get reused 'markdown-modern-url))))))
 
+(ert-deftest render/web-links-have-terminal-url ()
+  "Web link labels and autolinks expose a text property for TTY redisplay."
+  (dolist (url '("https://example.com/path" "http://example.com/path"
+                 "HTTPS://example.com/path"))
+    (dolist (source (list (format "see [docs](%s) end\n" url)
+                         (format "see <%s> end\n" url)))
+      (markdown-modern-render-test--with source
+        (let* ((start 6)
+               (end (+ start (if (eq (char-after 5) ?\[) 4 (length url)))))
+          (should (equal (get-text-property start 'browse-url-data) url))
+          (should (equal (get-text-property (1- end) 'browse-url-data) url))
+          (should-not (get-text-property (1- start) 'browse-url-data))
+          (should-not (get-text-property end 'browse-url-data))
+          (should (eq (get-char-property start 'keymap)
+                      markdown-modern-render--link-keymap))
+          (markdown-modern-render-test--move start)
+          (should (equal (get-text-property start 'browse-url-data) url))
+          (markdown-modern--jit-fontify (point-min) (point-max))
+          (should (equal (get-text-property start 'browse-url-data) url))
+          (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                         source)))))))
+
+(ert-deftest render/nonweb-links-have-no-terminal-url ()
+  "Local links, anchors and other schemes retain ordinary link navigation."
+  (dolist (url '("notes.md" "file:///tmp/notes.md" "#heading"
+                 "mailto:user@example.com" "ftp://example.com/file"
+                 "magnet:?xt=urn:btih:abc" "notes.el:12" "http://"
+                 "https://"))
+    (markdown-modern-render-test--with (format "see [docs](%s) end\n" url)
+      (should (equal (get-char-property 6 'markdown-modern-url) url))
+      (should-not (text-property-not-all (point-min) (point-max)
+                                       'browse-url-data nil)))))
+
+(ert-deftest render/terminal-url-cleanup ()
+  "Edits and clearing remove owned metadata, preserving other browser links."
+  (markdown-modern-render-test--with "see [docs](https://example.com) end\n"
+    (put-text-property 1 4 'browse-url-data "https://unrelated.example")
+    (goto-char 6)
+    (insert "more")
+    (goto-char (point-min))
+    (search-forward "https://example.com")
+    (replace-match "notes.md" t t)
+    (markdown-modern--jit-fontify (point-min) (point-max))
+    (should-not (get-text-property 6 'browse-url-data))
+    (should (equal (get-text-property 1 'browse-url-data)
+                   "https://unrelated.example"))
+    (goto-char (point-min))
+    (search-forward "notes.md")
+    (replace-match "http://example.com" t t)
+    (set-buffer-modified-p nil)
+    (markdown-modern--jit-fontify (point-min) (point-max))
+    (should (equal (get-text-property 6 'browse-url-data) "http://example.com"))
+    (should-not (buffer-modified-p))
+    (markdown-modern-render--unrender-region 5 (point-max))
+    (should-not (get-text-property 6 'browse-url-data))
+    (markdown-modern--jit-fontify (point-min) (point-max))
+    (markdown-modern-render--clear-all)
+    (should-not (get-text-property 6 'browse-url-data))
+    (should (equal (get-text-property 1 'browse-url-data)
+                   "https://unrelated.example"))
+    (should-not (buffer-modified-p))))
+
+(ert-deftest render/terminal-url-major-mode-change ()
+  "Switching major modes removes terminal hyperlink text properties."
+  (with-temp-buffer
+    (insert "see [docs](https://example.com) end\n")
+    (markdown-modern-mode)
+    (markdown-modern--jit-fontify (point-min) (point-max))
+    (should (get-text-property 6 'browse-url-data))
+    (text-mode)
+    (should-not (text-property-not-all (point-min) (point-max)
+                                     'browse-url-data nil))))
+
 (defun markdown-modern-render-test--assert-code-block ()
   (markdown-modern-render-test--with "```python\nprint(1)\n```\n"
     ;; The opening/closing fences are hidden.
