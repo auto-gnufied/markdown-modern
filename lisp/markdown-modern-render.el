@@ -648,6 +648,20 @@ fragments may name a heading or a line, such as #L352 or #L352-L365."
       (markdown-modern-render--follow-file-link url))
      (t (browse-url url)))))
 
+(defun markdown-modern-render--local-link-window ()
+  "Return another regular window on this frame, or the selected window.
+Skip side windows, dedicated windows, windows excluded from other-window,
+and buffers in special modes.  Never create a window."
+  (or (cl-find-if
+       (lambda (window)
+         (and (not (window-parameter window 'window-side))
+              (not (window-parameter window 'no-other-window))
+              (not (window-dedicated-p window))
+              (with-current-buffer (window-buffer window)
+                (not (derived-mode-p 'special-mode 'treemacs-mode)))))
+       (cdr (window-list nil 'nomini (selected-window))))
+      (selected-window)))
+
 (defun markdown-modern-render--follow-file-link (url)
   "Open local file URL in Emacs and navigate to its fragment, if present."
   (let* ((fragment-start (string-match "#" url))
@@ -667,8 +681,13 @@ fragments may name a heading or a line, such as #L352 or #L352-L365."
                 (decode-coding-string (url-unhex-string path) 'utf-8) base))
     (unless (file-exists-p path)
       (user-error "Link target does not exist: %s" path))
-    (xref-push-marker-stack)
-    (find-file path)
+    (let ((origin (point-marker))
+          (window (markdown-modern-render--local-link-window))
+          (buffer (find-file-noselect path)))
+      ;; Use this exact window rather than display-buffer rules that may split.
+      (set-window-buffer window buffer)
+      (select-window window)
+      (xref-push-marker-stack origin))
     (when (and fragment (not (string-empty-p fragment)))
       (markdown-modern-render--goto-link-fragment
        (decode-coding-string (url-unhex-string fragment) 'utf-8)))))
