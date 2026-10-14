@@ -142,6 +142,7 @@ Only the text that the edit marks for re-rendering is rendered again."
              (dotimes (line 400)
                (insert (format ";; Line %d\n" (1+ line)))))
            (save-window-excursion
+             (delete-other-windows)
              (with-temp-buffer
                (let ((source (current-buffer)))
                  (setq buffer-file-name (expand-file-name "walkthrough.md" directory)
@@ -248,14 +249,69 @@ Only the text that the edit marks for re-rendering is rendered again."
             (select-window other-window)
             (markdown-modern-render--follow-link-at-mouse
              (list 'mouse-1 position))
-            (should (eq (selected-window) source-window))
-            (should (equal (window-buffer source-window) (get-file-buffer target)))
-            (with-current-buffer (window-buffer source-window)
+            (should (eq (selected-window) other-window))
+            (should (eq (window-buffer source-window) source))
+            (should (= (length (window-list)) 2))
+            (should (equal (window-buffer other-window) (get-file-buffer target)))
+            (with-current-buffer (window-buffer other-window)
               (should (= (line-number-at-pos) 352)))
             (xref-go-back)
             (should (eq (current-buffer) source))
             (should (= (point) 8)))
         (kill-buffer " *link-other-window*")))))
+
+(ert-deftest render/local-link-reuses-existing-window ()
+  "Local links reuse either split orientation without invoking display rules."
+  (dolist (split '(split-window-right split-window-below))
+    (markdown-modern-render-test--with-local-file
+      (let* ((origin (selected-window))
+             (destination (funcall split))
+             (xref-history-storage #'xref-window-local-history)
+             (display-buffer-alist '((".*" . (display-buffer-pop-up-window)))))
+        (goto-char 8)
+        (markdown-modern-follow-link-at-point)
+        (should (eq (selected-window) destination))
+        (should (eq (window-buffer origin) source))
+        (should (equal buffer-file-name target))
+        (should (= (line-number-at-pos) 352))
+        (should (= (length (window-list)) 2))
+        (xref-go-back)
+        (should (eq (current-buffer) source))
+        (should (= (point) 8))))))
+
+(ert-deftest render/local-link-skips-special-windows ()
+  "Excluded windows remain untouched, with or without a regular alternative."
+  (dolist (excluded '(side dedicated no-other-window special treemacs))
+    (dolist (alternative '(nil t))
+      (markdown-modern-render-test--with-local-file
+        (let* ((origin (selected-window))
+               (special-buffer (generate-new-buffer " *local-link-special*"))
+               (special-window
+                (if (eq excluded 'side)
+                    (display-buffer-in-side-window special-buffer '((side . left)))
+                  (split-window-below)))
+               (destination (if alternative (split-window origin nil 'right) origin)))
+          (unwind-protect
+              (progn
+                (set-window-buffer special-window special-buffer)
+                (pcase excluded
+                  ('dedicated (set-window-dedicated-p special-window t))
+                  ('no-other-window
+                   (set-window-parameter special-window 'no-other-window t))
+                  ('special (with-current-buffer special-buffer (special-mode)))
+                  ('treemacs
+                   (with-current-buffer special-buffer (setq major-mode 'treemacs-mode))))
+                (let ((count (length (window-list))))
+                  (goto-char 8)
+                  (markdown-modern-follow-link-at-point)
+                  (should (eq (selected-window) destination))
+                  (should (eq (window-buffer special-window) special-buffer))
+                  (should (equal buffer-file-name target))
+                  (should (= (line-number-at-pos) 352))
+                  (should (= (length (window-list)) count))
+                  (when alternative
+                    (should (eq (window-buffer origin) source)))))
+            (kill-buffer special-buffer)))))))
 
 (ert-deftest render/link-mouse-down-and-overlay-reuse ()
   "Mouse-down keeps the label stable; pooled overlays lose link actions."

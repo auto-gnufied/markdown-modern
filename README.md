@@ -203,8 +203,11 @@ Click a link label to follow it, or use `C-c C-o` with point anywhere in
 the link, including its revealed source. Moving point into a link with the
 keyboard still reveals its markup for editing.
 
-Local file links open in the current Emacs window, with relative paths resolved
-against the Markdown file's directory. For example,
+Local file links reuse another regular window on the current frame when one
+exists, skipping side windows such as Treemacs, dedicated windows, windows
+excluded from `other-window`, and buffers in special modes. If no suitable
+window exists, they use the current window; following a link never creates a
+split. Relative paths resolve against the Markdown file's directory. For example,
 `[Source](pkg/core/static_autoscaler.go#L352)` opens that file at line 352.
 Line ranges such as `#L352-L365` jump to the first line; heading fragments such
 as `notes.md#installation` still work. Absolute paths, local `file:` URLs and

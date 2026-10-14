@@ -21,6 +21,9 @@ changes.
 - Clicking a link label no longer reveals its markup before the link opens.
   A click in another window follows the link in that window's buffer.
 
+- Local file links reuse another regular window when available, skipping side
+  and special windows. With no suitable alternative, they use the current
+  window without creating a split.
 - Extra left indentation now defaults to zero, so markdown-modern does not add
   space on top of the user's configured window margin.
 
