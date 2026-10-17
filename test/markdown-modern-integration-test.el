@@ -410,5 +410,101 @@ the inline grammar still parses them as such inside the code_span."
         ;; Should complete in under 5 seconds
         (should (< elapsed 5.0))))))
 
+
+(ert-deftest integration/code-edit-preserves-surrounding-rendering ()
+  "All editor exit paths preserve rendering outside the selected fence."
+  (dolist (finish '(markdown-modern-code-edit-finish
+                    markdown-modern-code-edit-abort kill-buffer))
+    (dolist (language '("emacs-lisp" "unknown" ""))
+      (save-window-excursion
+        (with-temp-buffer
+          (insert "# Heading\n\n**before** [link](https://example.com)\nsoft break\n\n")
+          (let ((start (point)))
+            (insert "```" language "\n(+ 1 2)\n```\n\n- **after**\n")
+            (markdown-modern-mode)
+            (jit-lock-fontify-now)
+            (goto-char start)
+            (forward-line 1)
+            (let ((source (current-buffer))
+                  (owned (seq-filter (lambda (o) (< (overlay-end o) start))
+                                     markdown-modern-render--overlays))
+                  edit)
+              (unwind-protect
+                  (progn
+                    (markdown-modern-edit-code-block)
+                    (setq edit (current-buffer))
+                    (should-not (derived-mode-p 'markdown-modern-mode))
+                    (should (cl-every (lambda (o) (eq (overlay-buffer o) source)) owned))
+                    (insert ";; edit\n")
+                    (funcall finish)
+                    (with-current-buffer source
+                      (should (cl-every (lambda (o) (eq (overlay-buffer o) source)) owned))
+                      (should (cl-every #'overlay-buffer markdown-modern-render--overlays))
+                      (should (memq #'markdown-modern--jit-fontify jit-lock-functions))))
+                (when (buffer-live-p edit) (kill-buffer edit))))))))))
+
+
+(ert-deftest integration/code-edit-failed-setup-cleans-up ()
+  "A language-mode error restores the source rendering and closes the editor."
+  (with-temp-buffer
+    (insert "**before**\n\n```emacs-lisp\nx\n```\n")
+    (markdown-modern-mode)
+    (jit-lock-fontify-now)
+    (goto-char (point-min))
+    (search-forward "x\n")
+    (let ((emacs-lisp-mode-hook (list (lambda () (error "setup failure"))))
+          (owned (copy-sequence markdown-modern-render--overlays)))
+      (should-error (markdown-modern-edit-code-block) :type 'error)
+      (should-not markdown-modern--code-edit-buffer)
+      (should (cl-every (lambda (o) (or (overlay-buffer o)
+                                       (memq o markdown-modern-render--overlay-pool))) owned))
+      (should (markdown-modern-ts--containing-block 1))
+      (should-not (seq-find (lambda (b) (eq (buffer-base-buffer b) (current-buffer)))
+                            (buffer-list))))))
+
+(ert-deftest integration/code-edit-source-shutdown ()
+  "Killing the source also closes its indirect editor and releases observers."
+  (save-window-excursion
+    (let ((source (generate-new-buffer " *mm-shutdown*")) edit)
+      (unwind-protect
+          (progn
+            (switch-to-buffer source)
+            (insert "```emacs-lisp\nx\n```\n")
+            (markdown-modern-mode)
+            (goto-char 15)
+            (markdown-modern-edit-code-block)
+            (setq edit (current-buffer))
+            (kill-buffer source)
+            (should-not (buffer-live-p edit))
+            (should-not (memq source markdown-modern--buffers)))
+        (when (buffer-live-p source) (kill-buffer source))
+        (when (buffer-live-p edit) (kill-buffer edit))))))
+
+
+(ert-deftest integration/code-edit-no-op-preserves-source-state ()
+  "Opening and closing an unchanged editor preserves source text and dirty state."
+  (dolist (finish '(markdown-modern-code-edit-finish markdown-modern-code-edit-abort))
+    (dolist (code '("```emacs-lisp\n(+ 1 2)\n```\n" "```unknown\ntext\n```\n" "```\n```\n"))
+      (save-window-excursion
+        (with-temp-buffer
+          (setq default-directory temporary-file-directory)
+          (insert code)
+          (markdown-modern-mode)
+          (jit-lock-fontify-now)
+          (set-buffer-modified-p nil)
+          (goto-char (point-min))
+          (let ((source (current-buffer)) (directory default-directory) edit)
+            (unwind-protect
+                (progn
+                  (markdown-modern-edit-code-block)
+                  (setq edit (current-buffer))
+                  (should (equal directory default-directory))
+                  (funcall finish)
+                  (with-current-buffer source
+                    (should-not (buffer-modified-p))
+                    (should (equal code (buffer-substring-no-properties
+                                         (point-min) (point-max))))))
+              (when (buffer-live-p edit) (kill-buffer edit)))))))))
+
 (provide 'markdown-modern-integration-test)
 ;;; markdown-modern-integration-test.el ends here

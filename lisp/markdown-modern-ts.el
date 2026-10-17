@@ -340,15 +340,31 @@ Optional START and END limit the range."
             "thematic_break" "pipe_table" "html_block")))
 
 (defun markdown-modern-ts--containing-block-bounds (start end)
-  "Get bounds of block containing region START to END."
-  (let ((block-start start)
-        (block-end end))
-    ;; Expand to block boundaries
-    (when-let* ((start-block (markdown-modern-ts--containing-block start)))
-      (setq block-start (min block-start (markdown-modern-node-start start-block))))
-    (when-let* ((end-block (markdown-modern-ts--containing-block end)))
-      (setq block-end (max block-end (markdown-modern-node-end end-block))))
-    (cons block-start block-end)))
+  "Return complete rendering bounds for half-open region START..END.
+Keep paragraphs, fences and tables intact, including their line prefixes.
+List and quote containers draw only the lines in this extent, so a small
+viewport inside a large container does not require rendering the whole list."
+  ;; Reveal bounds are integers and may still describe pre-deletion text.
+  (setq start (max (point-min) (min start (point-max)))
+        end (max start (min end (point-max))))
+  (let ((lo (save-excursion (goto-char start) (line-beginning-position)))
+        (hi (save-excursion
+              (goto-char (max start (1- end)))
+              (min (point-max) (1+ (line-end-position))))))
+    (dolist (element (markdown-modern-ts--elements-in-region lo hi))
+      (unless (memq (markdown-modern-node-type element) '(list blockquote))
+        (let* ((node (markdown-modern-node-treesit-node element))
+               (last (treesit-node-child node (1- (treesit-node-child-count node))))
+               ;; A paragraph may own the next line's quote prefix even though
+               ;; none of its inline/soft-break overlays extend onto that line.
+               (finish (if (and (eq (markdown-modern-node-type element) 'paragraph)
+                                last (equal (treesit-node-type last) "block_continuation"))
+                           (treesit-node-start last)
+                         (markdown-modern-node-end element))))
+          (setq lo (min lo (markdown-modern-node-start element))
+                hi (max hi finish)))))
+    (cons (save-excursion (goto-char lo) (line-beginning-position))
+          (min (point-max) hi))))
 
 ;;; Line/Region Queries
 

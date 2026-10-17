@@ -434,6 +434,15 @@ single source of truth shared between point-motion reveal and jit-lock.")
 (defvar-local markdown-modern--code-edit-buffer nil
   "Indirect buffer currently editing a code block, or nil.")
 
+(defvar markdown-modern--buffers nil
+  "Live buffers owning a Markdown Modern renderer.")
+
+(defvar-local markdown-modern--table-width nil
+  "Last effective table width checked by the layout observer.")
+
+(defvar-local markdown-modern--saved-margins nil
+  "Original margins of windows changed by reading-width management.")
+
 ;;; Mode Definition
 
 (defvar markdown-modern-mode-map
@@ -545,8 +554,7 @@ single source of truth shared between point-motion reveal and jit-lock.")
           (setq-local visual-fill-column-center-text nil)
           (visual-fill-column-mode 1))
       ;; Fallback: use window margins to constrain width
-      (markdown-modern--apply-text-width)
-      (add-hook 'window-size-change-functions #'markdown-modern--on-window-size-change)))
+      (markdown-modern--apply-text-width)))
 
   ;; Optional visual modes (enabled by default; configurable).
   (when markdown-modern-visual-line
@@ -556,6 +564,7 @@ single source of truth shared between point-motion reveal and jit-lock.")
 
   ;; Initialize rendering
   (markdown-modern-render--init)
+  (markdown-modern--observe-buffer)
 
   ;; Set up hooks.  Rendering itself is driven by jit-lock, which renders
   ;; only the visible region (and re-renders on scroll/edit).  The
@@ -567,62 +576,127 @@ single source of truth shared between point-motion reveal and jit-lock.")
   (add-hook 'after-change-functions #'markdown-modern--after-change nil t)
   ;; Clean up when switching to another major mode
   (add-hook 'change-major-mode-hook #'markdown-modern--teardown-buffer nil t)
+  (add-hook 'kill-buffer-hook #'markdown-modern--teardown-buffer nil t)
 
   ;; Set up imenu
   (setq-local imenu-create-index-function #'markdown-modern-imenu-create-index))
 
-(defun markdown-modern--apply-text-width ()
-  "Apply text width constraint using window margins."
-  (when (and markdown-modern-text-width (get-buffer-window))
-    (let* ((win (get-buffer-window))
-           (width (window-total-width win))
-           (text-width (+ markdown-modern-text-width markdown-modern-left-margin))
-           (right-margin (max 0 (- width text-width))))
-      (set-window-margins win markdown-modern-left-margin right-margin))))
+(defun markdown-modern--observe-buffer ()
+  "Register this renderer's layout and lifetime observers."
+  (cl-pushnew (current-buffer) markdown-modern--buffers)
+  (setq markdown-modern--table-width
+        (or markdown-modern-table-max-width (markdown-modern-render--table-display-width)))
+  ;; Remove the obsolete, globally shared margin hook when upgrading live.
+  (remove-hook 'window-size-change-functions 'markdown-modern--on-window-size-change)
+  (add-hook 'window-state-change-functions #'markdown-modern--refresh-layout)
+  (add-hook 'after-delete-frame-functions #'markdown-modern--refresh-layout)
+  (add-hook 'text-scale-mode-hook #'markdown-modern--refresh-layout nil t)
+  (add-hook 'kill-buffer-hook #'markdown-modern--teardown-buffer nil t))
 
-(defun markdown-modern--on-window-size-change (frame)
-  "Update text width for the windows of FRAME on a size change."
-  (dolist (win (window-list frame))
-    (with-current-buffer (window-buffer win)
-      (when (derived-mode-p 'markdown-modern-mode)
-        (markdown-modern--apply-text-width)))))
+(defun markdown-modern--apply-text-width (&optional window)
+  "Apply opted-in reading width to WINDOW, preserving its left margin."
+  (when (and markdown-modern-manage-text-width markdown-modern-text-width
+             (not (bound-and-true-p visual-fill-column-mode)))
+    (dolist (win (if window (list window) (get-buffer-window-list nil nil t)))
+      (unless (assq win markdown-modern--saved-margins)
+        (push (cons win (window-margins win)) markdown-modern--saved-margins))
+      (let* ((left (car (window-margins win)))
+             (text-width (+ markdown-modern-text-width markdown-modern-left-margin))
+             (right (max 0 (- (window-total-width win) (or left 0) text-width))))
+        (unless (equal (window-margins win) (cons left right))
+          (set-window-margins win left right))))))
+
+(defun markdown-modern--refresh-layout (&optional _frame)
+  "Invalidate tracked table extents when their effective layout width changes.
+Called for window-state and text-scale changes.  No document parsing occurs;
+unaffected buffers and unchanged geometry require no overlay traversal."
+  (dolist (buffer markdown-modern--buffers)
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when (eq markdown-modern-render--owner buffer)
+          (markdown-modern--apply-text-width)
+          (let ((width (or markdown-modern-table-max-width
+                           (markdown-modern-render--table-display-width))))
+            (unless (equal width markdown-modern--table-width)
+              (setq markdown-modern--table-width width)
+              (dolist (anchor markdown-modern-render--tables)
+                (when (eq (overlay-buffer anchor) buffer)
+                  (jit-lock-refontify (overlay-start anchor) (overlay-end anchor)))))))))))
 
 (defun markdown-modern--teardown-buffer ()
   "Clean up markdown-modern-mode resources from buffer."
-  ;; Stop jit-lock rendering and remove hooks
-  (jit-lock-unregister #'markdown-modern--jit-fontify)
-  (remove-hook 'post-command-hook #'markdown-modern--update-reveal t)
-  (remove-hook 'after-change-functions #'markdown-modern--after-change t)
-  (remove-hook 'change-major-mode-hook #'markdown-modern--teardown-buffer t)
-  (remove-hook 'window-size-change-functions #'markdown-modern--on-window-size-change)
+  ;; Indirect clones may inherit hooks and object references, not ownership.
+  (when (eq markdown-modern-render--owner (current-buffer))
+    (setq markdown-modern--rendering-enabled nil)
+    ;; Stop jit-lock rendering and remove hooks
+    (jit-lock-unregister #'markdown-modern--jit-fontify)
+    (remove-hook 'post-command-hook #'markdown-modern--update-reveal t)
+    (remove-hook 'after-change-functions #'markdown-modern--after-change t)
+    (remove-hook 'change-major-mode-hook #'markdown-modern--teardown-buffer t)
+    (remove-hook 'kill-buffer-hook #'markdown-modern--teardown-buffer t)
+    (remove-hook 'before-change-functions #'markdown-modern-render--before-change t)
+    (remove-hook 'after-change-functions #'markdown-modern-render--after-change t)
+    (remove-hook 'text-scale-mode-hook #'markdown-modern--refresh-layout t)
+    (setq markdown-modern--buffers (delq (current-buffer) markdown-modern--buffers))
+    (unless markdown-modern--buffers
+      (remove-hook 'window-state-change-functions #'markdown-modern--refresh-layout)
+      (remove-hook 'after-delete-frame-functions #'markdown-modern--refresh-layout))
 
-  ;; Reset state
-  (setq markdown-modern--revealed-region nil)
-  (when (and markdown-modern--code-edit-buffer
-             (buffer-live-p markdown-modern--code-edit-buffer))
-    (kill-buffer markdown-modern--code-edit-buffer))
-  (setq markdown-modern--code-edit-buffer nil)
+    ;; Reset state
+    (setq markdown-modern--revealed-region nil)
+    (when (and markdown-modern--code-edit-buffer
+               (buffer-live-p markdown-modern--code-edit-buffer))
+      (kill-buffer markdown-modern--code-edit-buffer))
+    (setq markdown-modern--code-edit-buffer nil)
 
-  ;; Disable only the visual modes markdown-modern turned on (see setup), so we
-  ;; don't clobber settings the user manages elsewhere.
-  (when (or markdown-modern-manage-text-width markdown-modern-visual-line)
-    (visual-line-mode -1))
-  (when (and markdown-modern-manage-text-width (fboundp 'visual-fill-column-mode))
-    (visual-fill-column-mode -1))
-  (when markdown-modern-variable-pitch
-    (variable-pitch-mode -1))
+    ;; Disable only the visual modes markdown-modern turned on (see setup), so we
+    ;; don't clobber settings the user manages elsewhere.
+    (when (or markdown-modern-manage-text-width markdown-modern-visual-line)
+      (visual-line-mode -1))
+    (when (and markdown-modern-manage-text-width (fboundp 'visual-fill-column-mode))
+      (visual-fill-column-mode -1))
+    (when markdown-modern-variable-pitch
+      (variable-pitch-mode -1))
 
-  ;; Reset line prefix
-  (setq-local line-prefix nil)
-  (setq-local wrap-prefix nil)
+    ;; Reset line prefix
+    (setq-local line-prefix nil)
+    (setq-local wrap-prefix nil)
 
-  ;; Reset window margins
-  (when (get-buffer-window)
-    (set-window-margins (get-buffer-window) nil nil))
+    ;; Restore only the margins this buffer actually managed.
+    (dolist (entry markdown-modern--saved-margins)
+      (when (and (window-live-p (car entry))
+		 (eq (window-buffer (car entry)) (current-buffer)))
+	(set-window-margins (car entry) (cadr entry) (cddr entry))))
+    (setq markdown-modern--saved-margins nil)
 
-  ;; Clear overlays
+    ;; Clear overlays
+    (markdown-modern-render--clear-all)
+    (markdown-modern-ts--cleanup)
+    (setq markdown-modern-render--owner nil)))
+
+;;;###autoload
+(defun markdown-modern-refresh ()
+  "Rebuild rendering lazily without changing source text or window margins.
+Use this once to recover a buffer whose old rendering state was damaged."
+  (interactive)
+  (unless (derived-mode-p 'markdown-modern-mode)
+    (user-error "Not a Markdown Modern buffer"))
+  (when (buffer-base-buffer)
+    (user-error "Refresh rendering in the base Markdown buffer"))
+  ;; Buffers opened before an upgrade have no owner tags.  Adopt only live
+  ;; package overlays actually in this buffer, never copied registry entries.
+  (unless (eq markdown-modern-render--owner (current-buffer))
+    (setq markdown-modern-render--owner (current-buffer)
+          markdown-modern-render--overlays
+          (seq-filter (lambda (ov) (overlay-get ov 'markdown-modern))
+                      (overlays-in (point-min) (point-max))))
+    (dolist (ov markdown-modern-render--overlays)
+      (overlay-put ov 'markdown-modern-owner (current-buffer))))
   (markdown-modern-render--clear-all)
-  (markdown-modern-ts--cleanup))
+  (markdown-modern-render--init)
+  (markdown-modern--observe-buffer)
+  (setq markdown-modern--revealed-region (markdown-modern--markup-element-at (point)))
+  (jit-lock-refontify))
 
 ;;;###autoload
 (define-derived-mode markdown-modern-mode text-mode "MdM"
@@ -770,8 +844,9 @@ must NOT be stripped the way other revealed markup is."
           (min end (line-end-position)))))
 
 (defun markdown-modern--extend-region-to-blocks (start end)
-  "Expand START..END outward to whole containing-block bounds.
-Clamp to the buffer and keep tables, fenced blocks and lists intact."
+  "Expand START..END to complete rendering bounds, clamped to the buffer.
+Keep paragraphs, tables and fenced blocks intact.  List and quote prefixes
+are rendered only within the resulting extent."
   (let ((bounds (markdown-modern-ts--containing-block-bounds start end)))
     (cons (max (point-min) (min start (car bounds)))
           (min (point-max) (max end (cdr bounds))))))
@@ -783,23 +858,8 @@ renders, then re-reveals the element under point so the revealed markup
 survives scroll/edit re-renders.  Returns a `jit-lock-bounds' cons reporting
 the true rendered extent."
   (when markdown-modern--rendering-enabled
-    (let* ((b (markdown-modern--extend-region-to-blocks start end))
-           (bstart (car b))
-           (bend (cdr b)))
-      (markdown-modern-render--render-region bstart bend)
-      ;; Keep the element under point revealed across re-renders (markup
-      ;; visible, styling preserved).  A revealed table row is an exception: the
-      ;; table renderer already drew it as an editable grid row during
-      ;; `render-region' above, so stripping its display overlays here would
-      ;; destroy that.
-      (when (and markdown-modern--revealed-region
-                 (< (car markdown-modern--revealed-region) bend)
-                 (> (cdr markdown-modern--revealed-region) bstart)
-                 (not (markdown-modern--table-row-region-p markdown-modern--revealed-region)))
-        (markdown-modern-render--reveal-markup
-         (max bstart (car markdown-modern--revealed-region))
-         (min bend (cdr markdown-modern--revealed-region))))
-      `(jit-lock-bounds ,bstart . ,bend))))
+    (when-let* ((bounds (markdown-modern-render--render-region start end)))
+      `(jit-lock-bounds ,(car bounds) . ,(cdr bounds)))))
 
 (defun markdown-modern--inline-element-at (pos start end)
   "Return (S . E) of the smallest inline markup element at POS within START..END.

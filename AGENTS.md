@@ -85,6 +85,10 @@ should normally be made here.
   use-package, release tarball, and manual installation paths. Preserve the
   `lisp/` layout used by packaging and installation scripts.
 
+## Using Emacs mcp server
+
+If available the agent can use emacs MCP server configured via ~/.emacs.d/straight/repos/emacs-mcp-server/ for Emacs-aware operations such as evaluating Elisp, inspecting buffers, and collecting diagnostics. The server is started in Emacs through `mcp-server-start-unix`; the agent-shell config will start it on demand if it is not already running.
+
 ## Validation
 
 Use the smallest check that covers the change. Documentation-only edits need

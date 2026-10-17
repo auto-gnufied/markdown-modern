@@ -49,9 +49,12 @@
 
 ;; Functions defined in markdown-modern-ts.el
 (declare-function markdown-modern-ts--elements-in-region "markdown-modern-ts")
+(declare-function markdown-modern-ts--containing-block-bounds "markdown-modern-ts")
 (declare-function markdown-modern-ts--inline-elements-in "markdown-modern-ts")
 (declare-function markdown-modern-ts--literal-inline-at-p "markdown-modern-ts")
-(declare-function markdown-modern-ts--children "markdown-modern-ts")
+(declare-function markdown-modern-ts--make-element "markdown-modern-ts")
+(declare-function markdown-modern-node-treesit-node "markdown-modern-ts")
+(declare-function markdown-modern--table-row-region-p "markdown-modern")
 (declare-function markdown-modern-node-type "markdown-modern-ts")
 (declare-function markdown-modern-node-start "markdown-modern-ts")
 (declare-function markdown-modern-node-end "markdown-modern-ts")
@@ -60,6 +63,18 @@
 (declare-function markdown-modern-node-properties "markdown-modern-ts")
 
 ;;; Internal Variables
+
+(defvar markdown-modern-render--region nil
+  "Dynamically bound extent constraining container renderers.")
+
+(defvar-local markdown-modern-render--owner nil
+  "Buffer that owns this renderer's state, even when locals are cloned.")
+
+(defvar-local markdown-modern-render--changed-overlays nil
+  "Overlays that might evaporate during the current text change.")
+
+(defvar-local markdown-modern-render--tables nil
+  "Owned anchor overlays spanning already rendered tables.")
 
 (defvar-local markdown-modern-render--overlays nil
   "List of active overlays in the buffer.")
@@ -114,6 +129,11 @@
 
 (defun markdown-modern-render--init ()
   "Initialize the rendering engine for current buffer."
+  (setq markdown-modern-render--owner (current-buffer))
+  (setq markdown-modern-render--tables nil)
+  (setq markdown-modern-render--changed-overlays nil)
+  (add-hook 'before-change-functions #'markdown-modern-render--before-change nil t)
+  (add-hook 'after-change-functions #'markdown-modern-render--after-change nil t)
   (setq markdown-modern-render--overlays '())
   (setq markdown-modern-render--overlay-pool '())
   (setq markdown-modern-render--active-soft-breaks nil)
@@ -149,43 +169,54 @@
 ;;; Overlay Management
 
 (defun markdown-modern-render--get-overlay (start end)
-  "Get an overlay for region START to END, reusing from pool if possible."
+  "Get an owned overlay for START..END, reusing a detached one when possible."
+  ;; Cloned locals may contain another buffer's pool.  Never adopt its objects.
+  (while (and markdown-modern-render--overlay-pool
+              (let ((ov (car markdown-modern-render--overlay-pool)))
+                (or (overlay-buffer ov)
+                    (not (eq (overlay-get ov 'markdown-modern-owner)
+                             (current-buffer))))))
+    (pop markdown-modern-render--overlay-pool))
   (let ((ov (or (pop markdown-modern-render--overlay-pool)
                 (make-overlay start end nil t nil))))
-    (move-overlay ov start end)
-    ;; Clear any existing properties when reusing from pool
-    (overlay-put ov 'display nil)
-    (overlay-put ov 'face nil)
-    (overlay-put ov 'invisible nil)
-    (overlay-put ov 'before-string nil)
-    (overlay-put ov 'after-string nil)
-    (overlay-put ov 'wrap-prefix nil)
-    (overlay-put ov 'line-prefix nil)
-    (overlay-put ov 'priority nil)
-    (overlay-put ov 'keymap nil)
-    (overlay-put ov 'mouse-face nil)
-    (overlay-put ov 'follow-link nil)
-    (overlay-put ov 'markdown-modern-url nil)
-    ;; Set standard properties
+    (move-overlay ov start end (current-buffer))
+    ;; Clear all properties, including type/help metadata and border strings.
+    (let ((properties (overlay-properties ov)))
+      (while properties
+        (overlay-put ov (pop properties) nil)
+        (pop properties)))
     (overlay-put ov 'markdown-modern t)
+    (overlay-put ov 'markdown-modern-owner (current-buffer))
     (overlay-put ov 'evaporate t)
     (push ov markdown-modern-render--overlays)
     ov))
 
 (defun markdown-modern-render--release-overlay (ov)
-  "Release overlay OV back to the pool."
-  (setq markdown-modern-render--active-soft-breaks
-        (delq ov markdown-modern-render--active-soft-breaks))
-  (when (overlay-buffer ov)
-    (overlay-put ov 'display nil)
-    (overlay-put ov 'face nil)
-    (overlay-put ov 'invisible nil)
-    (overlay-put ov 'before-string nil)
-    (overlay-put ov 'after-string nil)
-    (overlay-put ov 'help-echo nil)
+  "Release owned OV, including an evaporated object, exactly once."
+  (when (eq (overlay-get ov 'markdown-modern-owner) (current-buffer))
+    (setq markdown-modern-render--active-soft-breaks
+          (delq ov markdown-modern-render--active-soft-breaks)
+          markdown-modern-render--tables
+          (delq ov markdown-modern-render--tables)
+          markdown-modern-render--overlays
+          (delq ov markdown-modern-render--overlays))
     (delete-overlay ov)
-    (setq markdown-modern-render--overlays (delq ov markdown-modern-render--overlays))
-    (push ov markdown-modern-render--overlay-pool)))
+    (unless (overlay-get ov 'markdown-modern-pooled)
+      (overlay-put ov 'markdown-modern-pooled t)
+      (push ov markdown-modern-render--overlay-pool))))
+
+(defun markdown-modern-render--before-change (start end)
+  "Remember overlays in START..END that could evaporate during an edit."
+  (when (eq markdown-modern-render--owner (current-buffer))
+    (setq markdown-modern-render--changed-overlays (overlays-in start end))))
+
+(defun markdown-modern-render--after-change (&rest _)
+  "Recycle overlays evaporated by the preceding change, without a buffer scan."
+  (when (eq markdown-modern-render--owner (current-buffer))
+    (dolist (ov markdown-modern-render--changed-overlays)
+      (unless (overlay-buffer ov)
+        (markdown-modern-render--release-overlay ov)))
+    (setq markdown-modern-render--changed-overlays nil)))
 
 (defun markdown-modern-render--clear-region (start end)
   "Clear markdown-modern overlays and URL metadata from START to END."
@@ -195,15 +226,20 @@
       (markdown-modern-render--release-overlay ov))))
 
 (defun markdown-modern-render--clear-all ()
-  "Clear all markdown-modern overlays and URL metadata in the buffer."
-  (markdown-modern-render--clear-terminal-urls (point-min) (point-max))
-  (dolist (ov markdown-modern-render--overlays)
-    (when (overlay-buffer ov)
-      (delete-overlay ov)))
-  (setq markdown-modern-render--overlays nil)
-  (setq markdown-modern-render--overlay-pool nil)
-  (setq markdown-modern-render--active-soft-breaks nil)
-  (setq markdown-modern-render--unfolded nil))
+  "Clear this buffer's rendering without touching cloned source state."
+  (when (eq markdown-modern-render--owner (current-buffer))
+    (markdown-modern-render--clear-terminal-urls (point-min) (point-max))
+    ;; The pool is discarded too, so avoid quadratic registry/pool maintenance
+    ;; when closing or explicitly refreshing a large, already rendered buffer.
+    (dolist (ov markdown-modern-render--overlays)
+      (when (eq (overlay-get ov 'markdown-modern-owner) (current-buffer))
+        (delete-overlay ov)))
+    (setq markdown-modern-render--overlays nil
+          markdown-modern-render--overlay-pool nil
+          markdown-modern-render--tables nil
+          markdown-modern-render--changed-overlays nil
+          markdown-modern-render--active-soft-breaks nil
+          markdown-modern-render--unfolded nil)))
 
 ;;; Core Rendering Functions
 
@@ -215,18 +251,38 @@
            table-regions))
 
 (defun markdown-modern-render--render-region (start end)
-  "Render markdown elements in region from START to END."
+  "Render the complete extent around START..END and return its bounds.
+Container prefix renderers stay within this extent; paragraphs, fences and
+tables are rendered atomically.  Preserve the current reveal state."
   (when (and (not markdown-modern-render--rendering-p)
              markdown-modern--rendering-enabled)
-    (let ((markdown-modern-render--rendering-p t)
-          (inhibit-read-only t))
+    (let* ((bounds (markdown-modern-ts--containing-block-bounds start end))
+           (start (car bounds))
+           (end (cdr bounds))
+           (markdown-modern-render--region bounds)
+           (markdown-modern-render--rendering-p t)
+           (inhibit-read-only t))
       (with-silent-modifications
         (markdown-modern-render--clear-region start end)
-        (let ((elements (markdown-modern-ts--elements-in-region start end)))
+        (let ((elements (markdown-modern-ts--elements-in-region start end))
+              (quote-end (point-min)))
           (dolist (elem elements)
-            (markdown-modern-render--render-element elem))))
+            ;; An outer quote already handles prefixes on its nested lines.
+            (if (eq (markdown-modern-node-type elem) 'blockquote)
+                (when (>= (markdown-modern-node-start elem) quote-end)
+                  (setq quote-end (markdown-modern-node-end elem))
+                  (markdown-modern-render--render-element elem))
+              (markdown-modern-render--render-element elem)))))
       ;; Rendering shows every soft break as a space.
-      (markdown-modern-render--sync-soft-breaks))))
+      (markdown-modern-render--sync-soft-breaks)
+      (when (and markdown-modern--revealed-region
+                 (< (car markdown-modern--revealed-region) end)
+                 (> (cdr markdown-modern--revealed-region) start)
+                 (not (markdown-modern--table-row-region-p markdown-modern--revealed-region)))
+        (markdown-modern-render--reveal-markup
+         (max start (car markdown-modern--revealed-region))
+         (min end (cdr markdown-modern--revealed-region))))
+      bounds)))
 
 (defun markdown-modern-render--unrender-region (start end)
   "Remove rendering from region START to END."
@@ -1083,8 +1139,10 @@ Dispatches to mermaid renderer for mermaid code blocks."
   "Render blockquote element ELEM.
 Uses simple styling that works well with `visual-line-mode' wrapping.
 Also handles list items inside blockquotes."
-  (let ((start (markdown-modern-node-start elem))
-        (end (markdown-modern-node-end elem))
+  (let ((start (max (markdown-modern-node-start elem)
+                    (or (car markdown-modern-render--region) (point-min))))
+        (end (min (markdown-modern-node-end elem)
+                  (or (cdr markdown-modern-render--region) (point-max))))
         ;; Get the base indentation from the buffer's line-prefix
         (base-indent (or (and (boundp 'markdown-modern-left-margin)
                               (make-string markdown-modern-left-margin ?\s))
@@ -1155,10 +1213,18 @@ Also handles list items inside blockquotes."
         (forward-line 1)))))
 
 (defun markdown-modern-render--list (elem)
-  "Render list element ELEM."
-  ;; Lists are containers, render children
-  (dolist (child (markdown-modern-ts--children elem))
-    (markdown-modern-render--render-element child)))
+  "Render the markers of ELEM's items within the current render extent.
+Seek directly to the first relevant child rather than walking a large list."
+  (let* ((start (or (car markdown-modern-render--region) (markdown-modern-node-start elem)))
+         (end (or (cdr markdown-modern-render--region) (markdown-modern-node-end elem)))
+         (child (treesit-node-first-child-for-pos
+                 (markdown-modern-node-treesit-node elem) start t)))
+    (while (and child (< (treesit-node-start child) end))
+      ;; An enclosing item can start before this extent; its nested list is a
+      ;; separate query capture and handles the markers that actually overlap.
+      (when (>= (treesit-node-start child) start)
+        (markdown-modern-render--render-element (markdown-modern-ts--make-element child)))
+      (setq child (treesit-node-next-sibling child t)))))
 
 (defun markdown-modern-render--list-item (elem)
   "Render list item element ELEM.
@@ -1352,19 +1418,19 @@ width calculation and the row formatter so they always agree."
                    s "")
       s)))
 
-(defun markdown-modern-render--table-char-pixel-width ()
+(defun markdown-modern-render--table-char-pixel-width (&optional window)
   "Approximate on-screen pixel width of one fixed-pitch table character.
 Used only to size tables to the window (see
 `markdown-modern-render--table-display-width').  `window-font-width' reports the
 nominal width and ignores a `text-scale-mode' zoom, so multiply by the
 text-scale factor.  This over-estimates the width slightly (so the table is
 sized a touch narrow), which is the safe direction: it never wraps.  Falls back
-to the frame's character width when no window/font info is available."
+to the frame's character width when no font info is available.
+WINDOW supplies the frame and font metrics when non-nil."
   (let ((base (or (ignore-errors
-                    (window-font-width (get-buffer-window (current-buffer))
-                                       'markdown-modern-table))
+                    (window-font-width window 'markdown-modern-table))
                   (ignore-errors (window-font-width nil 'markdown-modern-table))
-                  (and (fboundp 'frame-char-width) (frame-char-width))
+                  (and (fboundp 'frame-char-width) (frame-char-width (and window (window-frame window))))
                   8))
         (scale (if (and (boundp 'text-scale-mode-amount)
                         (boundp 'text-scale-mode-step)
@@ -1375,25 +1441,19 @@ to the frame's character width when no window/font info is available."
     (max 1 (round (* base scale)))))
 
 (defun markdown-modern-render--table-display-width ()
-  "Available width for tables, in fixed-pitch character columns.
-Computed from the window's body pixel width divided by the fixed-pitch
-character pixel width, so it is accurate even under `variable-pitch-mode'
-where the table font differs from the buffer's default font.  Table overlays
-override `line-prefix' to \"\", so the table starts at the left text edge and no
-prefix needs subtracting.  Falls back to 80 when the buffer is not displayed."
-  (let ((win (get-buffer-window (current-buffer))))
-    (if win
-        (let* ((char-px (markdown-modern-render--table-char-pixel-width))
-               (body-px (window-body-width win t))
-               (cols (/ body-px (max 1 char-px)))
-               ;; The table inherits the buffer's left-margin `line-prefix'
-               ;; uniformly (so multi-line cells stay aligned), so reserve room
-               ;; for it.  Counting the margin as that many table columns
-               ;; slightly over-reserves (the margin font is usually narrower),
-               ;; which is the safe direction -- the table never wraps.
-               (margin (or (bound-and-true-p markdown-modern-left-margin) 0)))
-          ;; Also leave a one-column safety margin on the right edge.
-          (max 20 (- cols margin 1)))
+  "Return the narrowest displaying window's fixed-pitch table capacity.
+A single buffer-wide layout fits all its windows when minimum column widths
+allow it.  Hidden buffers use 80 columns until displayed."
+  (let ((windows (get-buffer-window-list (current-buffer) nil t)))
+    (if windows
+        (apply #'min
+               (mapcar
+                (lambda (window)
+                  (let* ((char-px (markdown-modern-render--table-char-pixel-width window))
+                         (cols (floor (/ (window-body-width window t)
+                                         (max 1 char-px)))))
+                    (max 20 (- cols (or markdown-modern-left-margin 0) 1))))
+                windows))
       (or markdown-modern-table-max-width 80))))
 
 (defun markdown-modern-render--table-column-widths (rows)
@@ -1544,6 +1604,7 @@ empty overlay), so it is an independent grid line that the reveal-at-point logic
 leaves intact while a neighbouring row is being edited."
   (let ((ov (make-overlay pos pos nil t nil)))
     (overlay-put ov 'markdown-modern t)
+    (overlay-put ov 'markdown-modern-owner (current-buffer))
     (if after
         (overlay-put ov 'after-string string)
       (overlay-put ov 'before-string string))
@@ -1653,6 +1714,11 @@ Always finds the COMPLETE table by scanning beyond element boundaries."
       (when (and rows row-info)
         (let ((widths (markdown-modern-render--table-column-widths rows)))
           (when widths
+            (let ((anchor (markdown-modern-render--get-overlay
+                           (caar row-info)
+                           (min (point-max) (1+ (nth 1 (car (last row-info))))))))
+              (overlay-put anchor 'markdown-modern-type 'table-region)
+              (push anchor markdown-modern-render--tables))
             (markdown-modern-render--table-create-overlays
              rows row-info widths)))))))
 

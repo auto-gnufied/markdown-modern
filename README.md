@@ -224,11 +224,17 @@ item.
 Plain prose is never disturbed, so moving the cursor through ordinary text does
 no work. There is no source/rendered toggle to manage.
 
+If a buffer has damaged rendering left over from an older package version,
+run `M-x markdown-modern-refresh` once. It clears package rendering and lets
+`jit-lock` rebuild the visible region, preserving source text and window margins.
+
 You can also reveal the element at point on demand with
 `markdown-modern-toggle-element-at-point` (`C-c C-v e`).
 
 Inside a fenced code block, `C-c '` opens an indirect buffer narrowed to that
-block's contents, with the language's major mode when available. Edits update
+block's contents, with the language's major mode when available and `text-mode`
+otherwise. The editor shares text but keeps its modes and rendering state
+separate from the Markdown buffer. Edits update
 the Markdown buffer. Press `C-c '` again to finish, or `C-c C-k`
 to abort and restore the original code. Both return to the Markdown buffer and
 close a window opened for editing; a reused window restores its previous buffer.
@@ -290,6 +296,12 @@ Tables are sized to fit the window, so they never wrap the buffer: columns are
 narrowed to fit (down to `markdown-modern-table-min-column-width`) and cells
 whose content still doesn't fit wrap onto multiple lines. Raise
 `markdown-modern-table-max-width` for natural width instead.
+
+Automatic table layout updates when windows resize or text scale changes. If
+several windows show the same buffer, tables use the narrowest window's width
+budget. Minimum column widths can still prevent a table from fitting a very
+narrow window. An explicit `markdown-modern-table-max-width` keeps its chosen
+width independent of the windows.
 
 | Key | Command | Description |
 |-----|---------|-------------|

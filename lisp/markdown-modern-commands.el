@@ -50,6 +50,9 @@
 
 ;; Functions defined in markdown-modern.el
 (declare-function markdown-modern--fenced-code-block-content-at "markdown-modern")
+(declare-function markdown-modern--after-change "markdown-modern")
+(declare-function markdown-modern-render--before-change "markdown-modern-render")
+(declare-function markdown-modern-render--after-change "markdown-modern-render")
 
 ;; Functions defined in markdown-modern-render.el
 (declare-function markdown-modern-render--render-region "markdown-modern-render")
@@ -790,60 +793,81 @@ revealed lines (by parsing raw markdown syntax at point)."
 
 ;;;###autoload
 (defun markdown-modern-edit-code-block ()
-  "Edit code block at point in an indirect buffer with the correct major mode.
-Like org-mode's `org-edit-special': opens a narrowed indirect buffer
-with the language's major mode."
+  "Edit the fenced block at point in an isolated indirect language buffer."
   (interactive)
-  (when (and (boundp 'markdown-modern--code-edit-buffer)
-             markdown-modern--code-edit-buffer
+  (when (and markdown-modern--code-edit-buffer
              (buffer-live-p markdown-modern--code-edit-buffer))
     (user-error "Already editing a code block; finish or abort first"))
   (let ((info (markdown-modern--fenced-code-block-content-at (point))))
-    (unless info
-      (user-error "Not inside a fenced code block"))
+    (unless info (user-error "Not inside a fenced code block"))
     (let* ((source-buf (current-buffer))
+           (directory default-directory)
            (block-start (plist-get info :block-start))
            (block-end (plist-get info :block-end))
            (content-start (plist-get info :content-start))
            (content-end (plist-get info :content-end))
+           (block-bounds (cons (copy-marker block-start) (copy-marker block-end t)))
+           (content-bounds (cons (copy-marker content-start) (copy-marker content-end t)))
            (language (plist-get info :language))
            (original (buffer-substring-no-properties content-start content-end))
-           (buf-name (format "*MG-Edit:%s*"
-                             (or language "code")))
-           (edit-buf (make-indirect-buffer source-buf buf-name t)))
-      ;; Unrender the block so raw text is visible
-      (when (and (boundp 'markdown-modern--rendering-enabled)
+           ;; Share text, not the source renderer's locals, pools or hooks.
+           (edit-buf (make-indirect-buffer
+                      source-buf (generate-new-buffer-name
+                                  (format "*MG-Edit:%s*" (or language "code"))) nil))
+           ready)
+      (unwind-protect
+          (progn
+            (when markdown-modern--rendering-enabled
+              (markdown-modern-render--unrender-region block-start block-end))
+            (setq markdown-modern--code-edit-buffer edit-buf)
+            (with-current-buffer edit-buf
+              (setq default-directory directory)
+              (narrow-to-region content-start content-end)
+              (funcall (or (and language (markdown-modern-render--language-to-mode language))
+                           #'text-mode))
+              (setq markdown-modern-code-edit--source-buffer source-buf
+                    markdown-modern-code-edit--block-bounds block-bounds
+                    markdown-modern-code-edit--content-bounds content-bounds
+                    markdown-modern-code-edit--original-content original)
+              (markdown-modern-code-edit-mode 1)
+              (setq header-line-format
+                    (substitute-command-keys
+                     "Editing code block.  \\[markdown-modern-code-edit-finish] to finish, \\[markdown-modern-code-edit-abort] to abort"))
+              ;; Text is shared but modification hooks are buffer-local.
+              (add-hook 'before-change-functions #'markdown-modern-code-edit--before-change nil t)
+              (add-hook 'after-change-functions #'markdown-modern-code-edit--after-change nil t)
+              (add-hook 'kill-buffer-hook #'markdown-modern-code-edit--on-kill nil t))
+            (pop-to-buffer edit-buf)
+            (setq ready t))
+        (unless ready
+          (when (buffer-live-p edit-buf)
+            (with-current-buffer edit-buf
+              (remove-hook 'kill-buffer-hook #'markdown-modern-code-edit--on-kill t))
+            (kill-buffer edit-buf))
+          (markdown-modern-code-edit--refresh-source source-buf block-bounds))))))
+
+(defun markdown-modern-code-edit--before-change (start end)
+  "Track source overlays affected by the indirect edit at START..END."
+  (when (buffer-live-p markdown-modern-code-edit--source-buffer)
+    (with-current-buffer markdown-modern-code-edit--source-buffer
+      (markdown-modern-render--before-change start end))))
+
+(defun markdown-modern-code-edit--after-change (start end old-len)
+  "Invalidate the source region changed by an indirect edit."
+  (when (buffer-live-p markdown-modern-code-edit--source-buffer)
+    (with-current-buffer markdown-modern-code-edit--source-buffer
+      (markdown-modern-render--after-change)
+      (markdown-modern--after-change start end old-len))))
+
+(defun markdown-modern-code-edit--refresh-source (source bounds)
+  "Release editing state and refresh SOURCE's block at marker pair BOUNDS."
+  (when (buffer-live-p source)
+    (with-current-buffer source
+      (setq markdown-modern--code-edit-buffer nil)
+      (when (and (derived-mode-p 'markdown-modern-mode)
                  markdown-modern--rendering-enabled)
-        (markdown-modern-render--unrender-region block-start block-end))
-      ;; Set up state in source buffer
-      (setq markdown-modern--code-edit-buffer edit-buf)
-      ;; Set up the indirect buffer
-      (with-current-buffer edit-buf
-        (narrow-to-region content-start content-end)
-        ;; Set major mode based on language.
-        ;; Must run without delay-mode-hooks so font-lock, indentation,
-        ;; completion, and other mode features fully activate.
-        (when language
-          (let ((mode (markdown-modern-render--language-to-mode language)))
-            (when mode
-              (funcall mode))))
-        ;; Set buffer-local state
-        (setq markdown-modern-code-edit--source-buffer source-buf)
-        (setq markdown-modern-code-edit--block-bounds
-              (cons (copy-marker block-start) (copy-marker block-end t)))
-        (setq markdown-modern-code-edit--content-bounds
-              (cons (copy-marker content-start) (copy-marker content-end t)))
-        (setq markdown-modern-code-edit--original-content original)
-        ;; Enable the minor mode
-        (markdown-modern-code-edit-mode 1)
-        ;; Header line with hints
-        (setq header-line-format
-              (substitute-command-keys
-               "Editing code block.  \\[markdown-modern-code-edit-finish] to finish, \\[markdown-modern-code-edit-abort] to abort"))
-        ;; Clean up on external buffer kill
-        (add-hook 'kill-buffer-hook #'markdown-modern-code-edit--on-kill nil t))
-      ;; Show the edit buffer
-      (pop-to-buffer edit-buf))))
+        (jit-lock-refontify (car bounds) (cdr bounds))
+        (markdown-modern-render--render-region (car bounds) (cdr bounds))))))
 
 ;;;###autoload
 (defun markdown-modern-code-edit-finish ()
@@ -857,15 +881,7 @@ Re-renders the code block region."
         (edit-buf (current-buffer)))
     ;; Widen before switching
     (widen)
-    ;; Switch to source and clean up
-    (when (buffer-live-p source-buf)
-      (with-current-buffer source-buf
-        (setq markdown-modern--code-edit-buffer nil)
-        ;; Re-render the block region
-        (when (and (boundp 'markdown-modern--rendering-enabled)
-                   markdown-modern--rendering-enabled)
-          (markdown-modern-render--render-region
-           (marker-position (car block-bounds)) (marker-position (cdr block-bounds))))))
+    (markdown-modern-code-edit--refresh-source source-buf block-bounds)
     ;; Kill the edit buffer (remove hook first to avoid double-cleanup)
     (with-current-buffer edit-buf
       (remove-hook 'kill-buffer-hook #'markdown-modern-code-edit--on-kill t))
@@ -893,23 +909,16 @@ Re-renders the code block region."
         (save-excursion
           (let ((inhibit-read-only t))
             (goto-char (car content-bounds))
-            (delete-region (car content-bounds) (cdr content-bounds))
-            (insert original)))))
+            (unless (equal original (buffer-substring-no-properties
+                                     (car content-bounds) (cdr content-bounds)))
+              (delete-region (car content-bounds) (cdr content-bounds))
+              (insert original))))))
     (markdown-modern-code-edit-finish)))
 
 (defun markdown-modern-code-edit--on-kill ()
-  "Handle external kill of code edit buffer (e.g., \\`C-x k\\`).
-Cleans up source buffer state and re-renders the code block."
-  (when (and markdown-modern-code-edit--source-buffer
-             (buffer-live-p markdown-modern-code-edit--source-buffer))
-    (let ((source-buf markdown-modern-code-edit--source-buffer)
-          (block-bounds markdown-modern-code-edit--block-bounds))
-      (with-current-buffer source-buf
-        (setq markdown-modern--code-edit-buffer nil)
-        (when (and (boundp 'markdown-modern--rendering-enabled)
-                   markdown-modern--rendering-enabled)
-          (markdown-modern-render--render-region
-           (marker-position (car block-bounds)) (marker-position (cdr block-bounds))))))))
+  "Refresh the source after an external kill of the code edit buffer."
+  (markdown-modern-code-edit--refresh-source
+   markdown-modern-code-edit--source-buffer markdown-modern-code-edit--block-bounds))
 
 (provide 'markdown-modern-commands)
 ;;; markdown-modern-commands.el ends here
