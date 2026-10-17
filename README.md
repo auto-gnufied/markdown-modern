@@ -196,8 +196,9 @@ You can also reveal the element at point on demand with
 
 Inside a fenced code block, `C-c '` opens an indirect buffer narrowed to that
 block's contents, with the language's major mode when available. Edits update
-the Markdown buffer. Press `C-c '` again to finish, or `C-c C-k` to abort and
-restore the original code.
+the Markdown buffer. Press `C-c '` again to finish, or `C-c C-k`
+to abort and restore the original code. Both return to the Markdown buffer and
+close a window opened for editing; a reused window restores its previous buffer.
 
 Click a link label to follow it, or use `C-c C-o` with point anywhere in
 the link, including its revealed source. Moving point into a link with the

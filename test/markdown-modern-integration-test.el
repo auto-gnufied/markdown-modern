@@ -279,6 +279,59 @@ the inline grammar still parses them as such inside the code_span."
 
 ;;; Performance Smoke Test
 
+(ert-deftest integration/code-edit-restores-windows ()
+  "Finish and abort close new windows and preserve reused windows."
+  (dolist (key '("C-c '" "C-c C-k"))
+    (dolist (layout '(new reused same))
+      (save-window-excursion
+        (delete-other-windows)
+        (with-temp-buffer
+          (insert "```emacs-lisp\n(message \"original\")\n```\n")
+          (markdown-modern-mode)
+          (switch-to-buffer (current-buffer))
+          (goto-char (point-min))
+          (forward-line 1)
+          (let* ((source (current-buffer))
+                 (source-window (selected-window))
+                 (other-window (when (eq layout 'reused)
+                                 (split-window-right)))
+                 (other-buffer (window-buffer (or other-window source-window)))
+                 (display-buffer-alist
+                  `(("\\*MG-Edit:"
+                     ,(pcase layout
+                        ('new #'display-buffer-pop-up-window)
+                        ('reused #'display-buffer-use-some-window)
+                        ('same #'display-buffer-same-window))
+                     (inhibit-same-window . ,(not (eq layout 'same))))))
+                 (windows (window-list))
+                 edit)
+            (unwind-protect
+                (progn
+                  (execute-kbd-macro (kbd "C-c '"))
+                  (setq edit (current-buffer))
+                  (should (eq (buffer-base-buffer) source))
+                  (pcase layout
+                    ('new (should (= (length (window-list))
+                                     (1+ (length windows)))))
+                    ('reused (should (eq (selected-window) other-window)))
+                    ('same (should (eq (selected-window) source-window))))
+                  (goto-char (point-min))
+                  (insert ";; edited\n")
+                  (execute-kbd-macro (kbd key))
+                  (should-not (buffer-live-p edit))
+                  (should (equal (window-list) windows))
+                  (should (eq (selected-window) source-window))
+                  (should (eq (current-buffer) source))
+                  (should-not markdown-modern--code-edit-buffer)
+                  (when other-window
+                    (should (eq (window-buffer other-window) other-buffer)))
+                  (should (equal (buffer-string)
+                                 (if (equal key "C-c '")
+                                     "```emacs-lisp\n;; edited\n(message \"original\")\n```\n"
+                                   "```emacs-lisp\n(message \"original\")\n```\n"))))
+              (when (buffer-live-p edit)
+                (kill-buffer edit)))))))))
+
 (ert-deftest integration/code-edit-keeps-source-parsers ()
   "Opening and finishing or aborting the code editor preserves source parsing."
   (dolist (finish '(markdown-modern-code-edit-finish markdown-modern-code-edit-abort))
