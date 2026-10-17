@@ -859,17 +859,22 @@ Re-renders the code block region."
     (widen)
     ;; Switch to source and clean up
     (when (buffer-live-p source-buf)
-      (switch-to-buffer source-buf)
-      (setq markdown-modern--code-edit-buffer nil)
-      ;; Re-render the block region
-      (when (and (boundp 'markdown-modern--rendering-enabled)
-                 markdown-modern--rendering-enabled)
-        (markdown-modern-render--render-region
-         (marker-position (car block-bounds)) (marker-position (cdr block-bounds)))))
+      (with-current-buffer source-buf
+        (setq markdown-modern--code-edit-buffer nil)
+        ;; Re-render the block region
+        (when (and (boundp 'markdown-modern--rendering-enabled)
+                   markdown-modern--rendering-enabled)
+          (markdown-modern-render--render-region
+           (marker-position (car block-bounds)) (marker-position (cdr block-bounds))))))
     ;; Kill the edit buffer (remove hook first to avoid double-cleanup)
     (with-current-buffer edit-buf
       (remove-hook 'kill-buffer-hook #'markdown-modern-code-edit--on-kill t))
-    (kill-buffer edit-buf)))
+    ;; Honor the display action's quit-restore information before killing:
+    ;; close a new window, or restore the previous buffer in a reused window.
+    (quit-windows-on edit-buf t)
+    (when (buffer-live-p source-buf)
+      (pop-to-buffer source-buf
+                     '(display-buffer-reuse-window display-buffer-same-window)))))
 
 ;;;###autoload
 (defun markdown-modern-code-edit-abort ()
@@ -879,9 +884,7 @@ Re-renders the code block region."
     (user-error "Not in a code edit buffer"))
   (let ((source-buf markdown-modern-code-edit--source-buffer)
         (content-bounds markdown-modern-code-edit--content-bounds)
-        (block-bounds markdown-modern-code-edit--block-bounds)
-        (original markdown-modern-code-edit--original-content)
-        (edit-buf (current-buffer)))
+        (original markdown-modern-code-edit--original-content))
     ;; Widen so we can restore
     (widen)
     ;; Restore original content in the shared buffer text
@@ -892,19 +895,7 @@ Re-renders the code block region."
             (goto-char (car content-bounds))
             (delete-region (car content-bounds) (cdr content-bounds))
             (insert original)))))
-    ;; Switch to source and clean up
-    (when (buffer-live-p source-buf)
-      (switch-to-buffer source-buf)
-      (setq markdown-modern--code-edit-buffer nil)
-      ;; Re-render the block region
-      (when (and (boundp 'markdown-modern--rendering-enabled)
-                 markdown-modern--rendering-enabled)
-        (markdown-modern-render--render-region
-         (marker-position (car block-bounds)) (marker-position (cdr block-bounds)))))
-    ;; Kill the edit buffer
-    (with-current-buffer edit-buf
-      (remove-hook 'kill-buffer-hook #'markdown-modern-code-edit--on-kill t))
-    (kill-buffer edit-buf)))
+    (markdown-modern-code-edit-finish)))
 
 (defun markdown-modern-code-edit--on-kill ()
   "Handle external kill of code edit buffer (e.g., \\`C-x k\\`).
