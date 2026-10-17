@@ -19,6 +19,16 @@ changes.
 
 ### Fixed
 
+- Delayed image downloads follow their original placeholder after edits and
+  cannot overwrite a replacement image or a revealed element.
+- Display glyphs are buffer-local. Changing display capabilities invalidates
+  rendered markers and media fallbacks lazily, including offscreen diagrams.
+- Nested lists and blockquotes render their markers at parser positions.
+  List continuation lines keep their wrapping indentation, and tables inside
+  blockquotes retain the quote prefix and row-level editing grid.
+- Reentrant change hooks no longer lose overlay cleanup candidates. Disabling
+  text scaling restores the normal table width despite its remembered amount.
+
 - Opening a code editor no longer deletes the source buffer's rendering.
   Unknown code languages use a plain text editor, and failed setup cleans up.
 - Partial list and blockquote rendering stays within its cleared extent,

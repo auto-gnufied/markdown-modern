@@ -615,6 +615,7 @@ unaffected buffers and unchanged geometry require no overlay traversal."
       (with-current-buffer buffer
         (when (eq markdown-modern-render--owner buffer)
           (markdown-modern--apply-text-width)
+          (markdown-modern-render--refresh-display)
           (let ((width (or markdown-modern-table-max-width
                            (markdown-modern-render--table-display-width))))
             (unless (equal width markdown-modern--table-width)
@@ -833,8 +834,11 @@ must NOT be stripped the way other revealed markup is."
   (and region
        (save-excursion
          (goto-char (car region))
-         (beginning-of-line)
-         (looking-at-p "^[ \t]*|.+|[ \t]*$"))))
+         (let ((pipe (markdown-modern-render--table-line-start)))
+           (and pipe (<= (car region) pipe)
+                ;; The remembered end can lag behind typing in the active row.
+                ;; A quote marker ends at/before PIPE and is not a row reveal.
+                (> (cdr region) pipe))))))
 
 (defun markdown-modern--table-row-at (pos start end)
   "Return (BOL . EOL) of the table row line at POS, clamped to START..END."

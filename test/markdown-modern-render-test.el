@@ -1205,5 +1205,211 @@ closing pipe.  Only the pipe glyphs (`│') may carry a `display'."
     (should-not markdown-modern--revealed-region)
     (should-not markdown-modern-render--overlays)))
 
+
+(ert-deftest render/reentrant-change-hooks-release-both-edits ()
+  "A nested edit before our after-change hook cannot lose the outer candidates."
+  (with-temp-buffer
+    (insert "**one** **two**\n")
+    (markdown-modern-mode)
+    (jit-lock-fontify-now)
+    (let (nested)
+      (add-hook 'after-change-functions
+                (lambda (&rest _)
+                  (unless nested
+                    (setq nested t)
+                    (let ((inhibit-modification-hooks nil)) (delete-region 1 8)))) nil t)
+      (delete-region 1 8)
+      (should (cl-every #'overlay-buffer markdown-modern-render--overlays))
+      (should-not markdown-modern-render--changed-overlays))))
+
+(ert-deftest render/disabling-text-scale-restores-table-budget ()
+  "Disabling scaling does not keep using its remembered, inactive amount."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (markdown-modern-mode)
+      (let ((normal (markdown-modern-render--table-display-width)))
+        (text-scale-set 4)
+        (should (< (markdown-modern-render--table-display-width) normal))
+        (text-scale-mode -1)
+        (should (= normal (markdown-modern-render--table-display-width)))))))
+
+(ert-deftest render/display-characters-are-buffer-local ()
+  "Initializing another display does not change a buffer's rendered bullets."
+  (let ((a (generate-new-buffer " *mm-ascii*"))
+        (b (generate-new-buffer " *mm-graphic*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer a
+            (insert "- item\n")
+            (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) nil))
+                      ((symbol-function 'char-displayable-p) (lambda (&rest _) nil)))
+              (markdown-modern-render--init))
+            (markdown-modern-ts--init)
+            (markdown-modern--jit-fontify 1 (point-max)))
+          (with-current-buffer b
+            (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t)))
+              (markdown-modern-render--init)))
+          (with-current-buffer a
+            (markdown-modern--jit-fontify 1 (point-max))
+            (should (equal "*" (substring-no-properties
+                                (overlay-get (markdown-modern-render-test--ov 'list-marker) 'display))))))
+      (kill-buffer a) (kill-buffer b))))
+
+(ert-deftest render/async-image-request-keeps-its-placeholder-identity ()
+  "Downloads follow a shifted image but never a replacement or recycled overlay."
+  (require 'url)
+  (dolist (scenario '(shift replace in-place reveal mode-change disabled))
+    (let ((cache (make-temp-file "mm-image-test-")) callback)
+      (unwind-protect
+          (with-temp-buffer
+            (insert "![one](https://one.example/x.png)")
+            (markdown-modern-mode)
+            (setq markdown-modern-render--display-profile '(unicode t t t))
+            (markdown-modern-render--image-placeholder 1 (point-max) "one" "https://one.example/x.png")
+            (cl-letf (((symbol-function 'url-retrieve)
+                       (lambda (_url cb &rest _) (setq callback cb)))
+                      ((symbol-function 'create-image) (lambda (&rest _) '(image :type png))))
+              (markdown-modern-render--fetch-image-async
+               "https://one.example/x.png" cache (current-buffer) 1 (point-max) "one")
+              (pcase scenario
+                ('in-place (goto-char 1) (search-forward "one.example")
+                           (replace-match "two.example" t t))
+                ('disabled (setq-local markdown-modern-display-images nil))
+                ('shift (goto-char 1) (insert (make-string 100 ?x)))
+                ('replace (delete-region 1 (point-max))
+                          (insert "![two](https://two.example/x.png)")
+                          (markdown-modern-render--image-placeholder
+                           1 (point-max) "two" "https://two.example/x.png"))
+                ('reveal (setq markdown-modern--revealed-region (cons 1 (point-max)))
+                         (markdown-modern-render--reveal-markup 1 (point-max)))
+                ('mode-change (text-mode)))
+              (with-temp-buffer
+                (insert "HTTP/1.1 200 OK\r\n\r\nIMAGE_BYTES")
+                (funcall callback nil))
+              (if (eq scenario 'shift)
+                  (should (= 1 (markdown-modern-render-test--count 'image)))
+                (should (= 0 (markdown-modern-render-test--count 'image))))))
+        (delete-file cache)))))
+
+(ert-deftest render/nested-container-markers-and-continuation-prefixes ()
+  "Nested quotes and list bullets render, including continuation-line wrapping."
+  (dolist (case '(("- > quoted **bold**\n  > next line\n" quote-marker 2)
+                  ("> - outer\n>   - nested **bold**\n" list-marker 2)
+                  ("- first paragraph\n  continued **bold** text\n" list-content 1)))
+    (markdown-modern-render-test--with (car case)
+      (should (= (nth 2 case) (markdown-modern-render-test--count (nth 1 case))))
+      (goto-char (point-min))
+      (forward-line 1)
+      (end-of-line)
+      (should (stringp (get-char-property (1- (point)) 'wrap-prefix)))
+      (let ((count (length markdown-modern-render--overlays)))
+        (dotimes (_ 3)
+          (markdown-modern--jit-fontify (1- (point)) (point))
+          (should (= count (length markdown-modern-render--overlays))))))))
+
+(ert-deftest render/quoted-table-keeps-grid-and-active-row ()
+  "A quoted table renders as a grid and reveals only its active row."
+  (markdown-modern-render-test--with "> | a | b |\n> |---|---|\n> | x | y |\n"
+    (should (= 2 (markdown-modern-render-test--count 'table-grid-line)))
+    (should (= 3 (markdown-modern-render-test--count 'quote-marker)))
+    (goto-char (point-min)) (forward-line 2) (forward-char 4)
+    (markdown-modern--update-reveal)
+    (should (> (markdown-modern-render-test--count 'table-edit) 0))
+    (should (= 2 (markdown-modern-render-test--count 'table-grid-line)))
+    (should (= 3 (markdown-modern-render-test--count 'quote-marker)))))
+
+
+(ert-deftest render/display-transition-invalidates-glyphs-lazily ()
+  "Changed capabilities invalidate old glyphs, while unchanged ones do no work."
+  (let ((profile '(ascii nil nil nil)))
+    (cl-letf (((symbol-function 'markdown-modern-render--display-capabilities)
+               (lambda () profile)))
+      (with-temp-buffer
+        (insert "- item\n")
+        (markdown-modern-mode)
+        (jit-lock-fontify-now)
+        (should (equal "*" (substring-no-properties
+                            (overlay-get (markdown-modern-render-test--ov 'list-marker) 'display))))
+        (setq profile '(unicode t nil nil))
+        (markdown-modern--refresh-layout)
+        (should-not (get-text-property 1 'fontified))
+        (jit-lock-fontify-now)
+        (should (equal "●" (substring-no-properties
+                            (overlay-get (markdown-modern-render-test--ov 'list-marker) 'display))))
+        (let ((before (copy-sequence markdown-modern-render--overlays)))
+          (markdown-modern--refresh-layout)
+          (should (get-text-property 1 'fontified))
+          (should (equal before markdown-modern-render--overlays)))))))
+
+(ert-deftest render/display-transition-recovers-media-fallback ()
+  "An existing source fallback becomes an SVG after display support appears."
+  (let ((profile '(unicode t nil nil)))
+    (cl-letf (((symbol-function 'markdown-modern-render--display-capabilities)
+               (lambda () profile))
+              ((symbol-function 'create-image) (lambda (&rest _) '(image :type svg))))
+      (with-temp-buffer
+        (insert "ordinary prose\n\n```mermaid\ngraph TD\nA-->B\n```\n")
+        (markdown-modern-mode)
+        (jit-lock-fontify-now)
+        (should (> (markdown-modern-render-test--count 'mermaid-fallback) 0))
+        (dotimes (_ 2)
+          (setq profile '(unicode t t t))
+          (markdown-modern--refresh-layout)
+          (should (get-text-property 1 'fontified))
+          (should-not (get-text-property 20 'fontified))
+          (jit-lock-fontify-now)
+          (should (= 1 (markdown-modern-render-test--count 'mermaid-svg)))
+          (should (= 1 (length markdown-modern-render--media)))
+          (setq profile '(unicode t nil nil))
+          (markdown-modern--refresh-layout)
+          (jit-lock-fontify-now)
+          (should (= 0 (markdown-modern-render-test--count 'mermaid-svg)))
+          (should (> (markdown-modern-render-test--count 'mermaid-fallback) 0))
+          (should (= 1 (length markdown-modern-render--media))))))))
+
+(ert-deftest render/quote-prefix-does-not-consume-literal-code-markers ()
+  "Only actual quote containers style leading greater-than signs in code."
+  (markdown-modern-render-test--with "> ```text\n> > literal\n> ```\n"
+    (should (= 3 (markdown-modern-render-test--count 'quote-marker))))
+  (markdown-modern-render-test--with "> > nested\n> > continued\n"
+    (should (= 4 (markdown-modern-render-test--count 'quote-marker)))))
+
+(ert-deftest render/list-continuation-indent-with-source-lines ()
+  "Both soft-joined and unfolded paragraphs have the same list indentation."
+  (dolist (join '(nil t))
+    (with-temp-buffer
+      (insert "- first line\n  continuation\n\n  second paragraph\n  continued again\n")
+      (markdown-modern-mode)
+      (setq-local markdown-modern-join-paragraph-lines join)
+      (jit-lock-fontify-now)
+      (goto-char (point-min))
+      (forward-line 1)
+      (forward-char 4)
+      (should (equal "  " (get-char-property (point) 'wrap-prefix)))
+      (when join (markdown-modern-render--unfold-paragraph (point)))
+      (should (equal "  " (get-char-property (point) 'wrap-prefix)))
+      (forward-line 3)
+      (end-of-line)
+      (should (equal "  " (get-char-property (1- (point)) 'wrap-prefix))))))
+
+(ert-deftest render/quoted-table-marker-reveal-is-not-row-reveal ()
+  "A quote prefix on a table line is a marker, not a whole editable table row."
+  (markdown-modern-render-test--with "> | a | b |\n> |---|---|\n> | x | y |\n"
+    (should-not (markdown-modern--table-row-region-p '(1 . 3)))
+    (should (markdown-modern--table-row-region-p '(1 . 12)))))
+
+(ert-deftest render/quoted-table-typing-keeps-pipe-overlays ()
+  "The active grid survives typing while its remembered row end is stale."
+  (markdown-modern-render-test--with "> | a | b |\n> |---|---|\n> | x | y |\n"
+    (goto-char (point-min)) (forward-line 2) (search-forward "x")
+    (markdown-modern--update-reveal)
+    (insert "more")
+    (markdown-modern--update-reveal)
+    (markdown-modern--jit-fontify (line-beginning-position) (line-end-position))
+    (goto-char (line-beginning-position)) (search-forward "|")
+    (should (cl-some (lambda (ov) (equal (overlay-get ov 'display) "│"))
+                     (overlays-at (1- (point)))))))
+
 (provide 'markdown-modern-render-test)
 ;;; markdown-modern-render-test.el ends here
