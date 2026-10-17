@@ -10,11 +10,25 @@ changes.
 
 ### Added
 
+- `M-x markdown-modern-refresh` recovers damaged rendering without changing
+  source text or window margins.
+
 - Local links open files of any type in Emacs, relative to the Markdown file.
   Line fragments such as `#L352` and `#L352-L365` go to that line. `M-,` goes
   back to the Markdown buffer. A missing file reports an error.
 
 ### Fixed
+
+- Opening a code editor no longer deletes the source buffer's rendering.
+  Unknown code languages use a plain text editor, and failed setup cleans up.
+- Partial list and blockquote rendering stays within its cleared extent,
+  preventing duplicate overlays while keeping large lists responsive.
+- Evaporated overlays leave the active registry, and reused overlays clear
+  their previous metadata.
+- Tables reflow after window and text-scale changes, including tables outside
+  the viewport. Automatic layout uses the narrowest window showing a buffer.
+  Closing a Markdown buffer preserves other buffers' layout observers and
+  user-configured margins.
 
 - `C-c '` could open an empty edit buffer when Tree-sitter skipped the code
   block's content node. It now shows the block's contents.

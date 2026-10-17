@@ -976,5 +976,300 @@ closing pipe.  Only the pipe glyphs (`│') may carry a `display'."
       (should (> fill-before-strings 0))    ; padding is virtual
       (should (= display-over-text 0)))))   ; cell text is never covered
 
+
+(ert-deftest render/partial-container-render-is-idempotent ()
+  "Partial renders have the same output as a complete container render."
+  (dolist (text '("- first **bold**\n  continuation\n- second `code`\n"
+                  "- outer\n  - nested **bold**\n  - next\n- last\n"
+                  "> - first **bold**\n>   continuation\n> - next\n"))
+    (markdown-modern-render-test--with text
+      (let* ((snapshot
+              (lambda ()
+                (sort (mapcar (lambda (o)
+                                (list (overlay-start o) (overlay-end o)
+                                      (overlay-get o 'markdown-modern-type)
+                                      (overlay-get o 'display)
+                                      (overlay-get o 'face)))
+                              (overlays-in (point-min) (point-max)))
+                      (lambda (a b) (string< (prin1-to-string a)
+                                            (prin1-to-string b))))))
+             (expected (funcall snapshot)))
+        (goto-char (point-min))
+        (search-forward "bold")
+        (dotimes (_ 3)
+          (markdown-modern--jit-fontify (1- (point)) (point))
+          (should (equal expected (funcall snapshot))))
+        (should (equal text (buffer-substring-no-properties
+                             (point-min) (point-max))))))))
+
+(ert-deftest render/clone-cleanup-preserves-source-overlays ()
+  "A copied renderer registry never authorizes deleting the source's objects."
+  (with-temp-buffer
+    (insert "**bold** and [link](https://example.com)\n")
+    (markdown-modern-mode)
+    (jit-lock-fontify-now)
+    (let ((source (current-buffer))
+          (owned (copy-sequence markdown-modern-render--overlays))
+          clone)
+      (unwind-protect
+          (progn
+            (setq clone (make-indirect-buffer source " *mm-clone-test*" t))
+            (with-current-buffer clone (text-mode))
+            (should (cl-every (lambda (o) (eq (overlay-buffer o) source)) owned))
+            (should (get-text-property 15 'browse-url-data)))
+        (when (buffer-live-p clone) (kill-buffer clone))))))
+
+(ert-deftest render/evaporated-overlays-leave-registry ()
+  "Deleting markup does not leak dead objects through subsequent render cycles."
+  (with-temp-buffer
+    (buffer-enable-undo)
+    (insert "**bold**\n")
+    (markdown-modern-mode)
+    (dotimes (_ 4)
+      (jit-lock-fontify-now)
+      (let ((old (car markdown-modern-render--overlays)))
+        (delete-region (point-min) (1- (point-max)))
+        (jit-lock-fontify-now)
+        (should (cl-every #'overlay-buffer markdown-modern-render--overlays))
+        (markdown-modern-render--release-overlay old)
+        (markdown-modern-render--release-overlay old)
+        (should-not (memq old markdown-modern-render--overlays))
+        (should (= (length markdown-modern-render--overlay-pool)
+                   (length (cl-delete-duplicates (copy-sequence markdown-modern-render--overlay-pool) :test #'eq)))))
+      (goto-char (point-min))
+      (insert "**bold**"))))
+
+(ert-deftest render/table-resize-invalidates-offscreen-layout ()
+  "Window resize invalidates rendered tables even outside the visible region."
+  (save-window-excursion
+    (delete-other-windows)
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert "| A | B |\n|---|---|\n| a long cell here | another long cell |\n")
+      (markdown-modern-mode)
+      (jit-lock-fontify-now)
+      (let ((wide (markdown-modern-render--table-display-width)))
+        (split-window-right)
+        (run-hook-with-args 'window-state-change-functions (selected-frame))
+        (should (< (markdown-modern-render--table-display-width) wide))
+        (should-not (get-text-property 1 'fontified))
+        (jit-lock-fontify-now)
+        (should (= 2 (markdown-modern-render-test--count 'table-grid-line)))
+        (let ((tracked (copy-sequence markdown-modern-render--overlays)))
+          (run-hook-with-args 'window-state-change-functions (selected-frame))
+          (should (get-text-property 1 'fontified))
+          (should (equal tracked markdown-modern-render--overlays)))))))
+
+
+(ert-deftest render/large-list-partial-render-stays-local ()
+  "A viewport inside a large list does not render thousands of sibling items."
+  (with-temp-buffer
+    (dotimes (_ 3000) (insert "- item with **bold** and `code`\n"))
+    (markdown-modern-mode)
+    (dotimes (_ 3)
+      (let ((bounds (markdown-modern--jit-fontify 100 200)))
+        (should (< (- (cddr bounds) (cadr bounds)) 200))
+        (should (< (length markdown-modern-render--overlays) 100))))))
+
+(ert-deftest render/partial-table-at-eof-keeps-single-borders ()
+  "Repeated rendering releases zero-length borders at the end of the buffer."
+  (markdown-modern-render-test--with "| a | b |\n|---|---|\n| x | y |"
+    (dotimes (_ 4)
+      (markdown-modern--jit-fontify (1- (point-max)) (point-max))
+      (should (= 2 (markdown-modern-render-test--count 'table-grid-line)))
+      (should (= 1 (length markdown-modern-render--tables))))))
+
+(ert-deftest render/pool-reuse-clears-all-metadata ()
+  "Pooled link and border objects cannot retain type, help or display metadata."
+  (with-temp-buffer
+    (insert "text")
+    (markdown-modern-render--init)
+    (let ((ov (markdown-modern-render--get-overlay 1 3)))
+      (overlay-put ov 'markdown-modern-type 'link-text)
+      (overlay-put ov 'help-echo "old link")
+      (overlay-put ov 'before-string "border")
+      (markdown-modern-render--release-overlay ov)
+      (should (eq ov (markdown-modern-render--get-overlay 2 4)))
+      (should-not (overlay-get ov 'markdown-modern-type))
+      (should-not (overlay-get ov 'help-echo))
+      (should-not (overlay-get ov 'before-string)))))
+
+(ert-deftest render/refresh-recovers-legacy-state ()
+  "Explicit refresh repairs old state while preserving text, point and margins."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert "**bold** and `code`\nsource line\n")
+      (markdown-modern-mode)
+      (set-window-margins nil 3 2)
+      (jit-lock-fontify-now)
+      (set-buffer-modified-p nil)
+      (goto-char 4)
+      (let ((text (buffer-substring-no-properties (point-min) (point-max)))
+            (foreign (make-overlay 1 2))
+            (margins (window-margins)))
+        (delete-overlay (car markdown-modern-render--overlays))
+        ;; Simulate a buffer created by the pre-ownership implementation.
+        (setq markdown-modern-render--owner nil)
+        (dolist (ov markdown-modern-render--overlays)
+          (overlay-put ov 'markdown-modern-owner nil))
+        (markdown-modern-refresh)
+        (jit-lock-fontify-now)
+        (should (= 4 (point)))
+        (should-not (buffer-modified-p))
+        (should (equal text (buffer-substring-no-properties (point-min) (point-max))))
+        (should (equal margins (window-margins)))
+        (should (eq (overlay-buffer foreign) (current-buffer)))
+        (should (cl-every #'overlay-buffer markdown-modern-render--overlays))
+        (should (= 1 (markdown-modern-render-test--count 'strong-content)))
+        (should (= 1 (markdown-modern-render-test--count 'code-content)))))))
+
+(ert-deftest render/table-layout-window-lifecycle ()
+  "The narrowest displaying window controls layout, including hidden tables."
+  (save-window-excursion
+    (delete-other-windows)
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert "| a | b |\n|---|---|\n| x | y |\n\n")
+      (dotimes (_ 100) (insert "prose\n\n"))
+      (let ((last-table (point)))
+        (insert "| c | d |\n|---|---|\n| z | w |\n")
+        (markdown-modern-mode)
+        (jit-lock-fontify-now)
+        (let* ((large (selected-window))
+               (wide (markdown-modern-render--table-display-width))
+               (small (split-window large 25 'right)))
+          (set-window-buffer small (current-buffer))
+          (markdown-modern--refresh-layout)
+          (should (< (markdown-modern-render--table-display-width) wide))
+          (should-not (get-text-property last-table 'fontified))
+          (let ((narrow (markdown-modern-render--table-display-width)))
+            (with-selected-window small
+              (should (= narrow (markdown-modern-render--table-display-width)))))
+          (jit-lock-fontify-now)
+          (delete-window small)
+          (markdown-modern--refresh-layout)
+          (should (= wide (markdown-modern-render--table-display-width)))
+          (should-not (get-text-property last-table 'fontified))
+          (jit-lock-fontify-now)
+          (set-window-buffer large (get-buffer-create " *mm-hidden*"))
+          (unwind-protect
+              (progn
+                (markdown-modern--refresh-layout)
+                (should (= 80 (markdown-modern-render--table-display-width)))
+                (set-window-buffer large (current-buffer))
+                (markdown-modern--refresh-layout)
+                (should (= wide (markdown-modern-render--table-display-width)))
+                (should-not (get-text-property last-table 'fontified)))
+            (kill-buffer " *mm-hidden*")))))))
+
+(ert-deftest render/layout-lifetime-and-user-margins ()
+  "Closing one renderer leaves the observer and another buffer's margins intact."
+  (save-window-excursion
+    (let ((a (generate-new-buffer " *mm-layout-a*"))
+          (b (generate-new-buffer " *mm-layout-b*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer a)
+            (markdown-modern-mode)
+            (with-current-buffer b (markdown-modern-mode))
+            (set-window-margins nil 3 2)
+            (kill-buffer b)
+            (should (memq #'markdown-modern--refresh-layout window-state-change-functions))
+            (markdown-modern--refresh-layout)
+            (should (equal (window-margins) '(3 . 2)))
+            (text-mode)
+            (should (equal (window-margins) '(3 . 2))))
+        (when (buffer-live-p a) (kill-buffer a))
+        (when (buffer-live-p b) (kill-buffer b))))))
+
+(ert-deftest render/table-text-scale-and-explicit-width ()
+  "Scale changes invalidate automatic layout, while an explicit width stays fixed."
+  (require 'face-remap)
+  (save-window-excursion
+    (delete-other-windows)
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert "| a | b |\n|---|---|\n| x | y |\n")
+      (markdown-modern-mode)
+      (jit-lock-fontify-now)
+      (let ((width (markdown-modern-render--table-display-width)))
+        (text-scale-set 4)
+        (should (< (markdown-modern-render--table-display-width) width))
+        (should-not (get-text-property 1 'fontified)))
+      (setq-local markdown-modern-table-max-width 100)
+      (markdown-modern--refresh-layout)
+      (jit-lock-fontify-now)
+      (split-window-right)
+      (markdown-modern--refresh-layout)
+      (should (get-text-property 1 'fontified)))))
+
+(ert-deftest render/delete-and-undo-rebuilds-owned-overlays ()
+  "Undo restores markup and its rendering without dead registry entries."
+  (with-temp-buffer
+    (insert "**bold**\n")
+    (markdown-modern-mode)
+    (buffer-enable-undo)
+    (jit-lock-fontify-now)
+    (undo-boundary)
+    (delete-region 1 9)
+    (undo-boundary)
+    (undo 1)
+    (jit-lock-fontify-now)
+    (should (= 1 (markdown-modern-render-test--count 'strong-content)))
+    (should (cl-every #'overlay-buffer markdown-modern-render--overlays))))
+
+
+(ert-deftest render/layout-change-keeps-active-row-and-reveal ()
+  "Reflow keeps the active table row editable and the current paragraph state."
+  (save-window-excursion
+    (delete-other-windows)
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert "| name | value |\n|---|---|\n| first | second |\n")
+      (markdown-modern-mode)
+      (goto-char (point-min))
+      (forward-line 2)
+      (forward-char 3)
+      (markdown-modern--update-reveal)
+      (jit-lock-fontify-now)
+      (let ((reveal markdown-modern--revealed-region))
+        (split-window-right)
+        (markdown-modern--refresh-layout)
+        (jit-lock-fontify-now)
+        (should (equal reveal markdown-modern--revealed-region))
+        (should (> (markdown-modern-render-test--count 'table-edit) 0))
+        (should (= 2 (markdown-modern-render-test--count 'table-grid-line)))))))
+
+(ert-deftest render/borrowed-pool-does-not-move-source-objects ()
+  "Even a copied pool cannot transfer its source's detached overlay objects."
+  (with-temp-buffer
+    (insert "source")
+    (markdown-modern-render--init)
+    (let ((source (current-buffer))
+          (ov (markdown-modern-render--get-overlay 1 3)) clone)
+      (markdown-modern-render--release-overlay ov)
+      (unwind-protect
+          (progn
+            (setq clone (make-indirect-buffer source " *mm-pool-clone*" t))
+            (with-current-buffer clone
+              (should-not (eq ov (markdown-modern-render--get-overlay 2 4))))
+            (should-not (overlay-buffer ov))
+            (should (memq ov markdown-modern-render--overlay-pool)))
+        (when (buffer-live-p clone) (kill-buffer clone))))))
+
+(ert-deftest render/deleting-revealed-element-at-eof ()
+  "Deleting a revealed element cannot leave out-of-range render bounds."
+  (with-temp-buffer
+    (insert "**bold**")
+    (markdown-modern-mode)
+    (goto-char 4)
+    (markdown-modern--update-reveal)
+    (jit-lock-fontify-now)
+    (delete-region (point-min) (point-max))
+    (markdown-modern--update-reveal)
+    (should-not markdown-modern--revealed-region)
+    (should-not markdown-modern-render--overlays)))
+
 (provide 'markdown-modern-render-test)
 ;;; markdown-modern-render-test.el ends here
