@@ -26,6 +26,8 @@
 
 (require 'cl-lib)
 (require 'face-remap)
+(require 'treesit)
+(require 'seq)
 (require 'subr-x)
 (require 'url-parse)
 (require 'url-util)
@@ -33,6 +35,7 @@
 (require 'markdown-modern-mermaid)
 
 ;; Variables defined in markdown-modern-ts.el
+(defvar markdown-modern-ts--parser)
 
 ;; Variables defined in markdown-modern.el
 (defvar markdown-modern--rendering-enabled)
@@ -61,6 +64,7 @@
 (declare-function markdown-modern-node-level "markdown-modern-ts")
 (declare-function markdown-modern-node-language "markdown-modern-ts")
 (declare-function markdown-modern-node-properties "markdown-modern-ts")
+(declare-function jit-lock-refontify "jit-lock")
 
 ;;; Internal Variables
 
@@ -71,7 +75,13 @@
   "Buffer that owns this renderer's state, even when locals are cloned.")
 
 (defvar-local markdown-modern-render--changed-overlays nil
-  "Overlays that might evaporate during the current text change.")
+  "Stack of overlay candidates for pending, possibly reentrant text changes.")
+
+(defvar-local markdown-modern-render--display-profile nil
+  "Current (CHARSET NEWLINE IMAGES SVG) capabilities of this buffer's windows.")
+
+(defvar-local markdown-modern-render--media nil
+  "Anchor overlays for images and diagrams, including source fallbacks.")
 
 (defvar-local markdown-modern-render--tables nil
   "Owned anchor overlays spanning already rendered tables.")
@@ -93,16 +103,16 @@
 
 ;;; Display Character Sets
 
-(defvar markdown-modern-render--bullet-chars '(?● ?○ ?■ ?□)
+(defvar-local markdown-modern-render--bullet-chars '(?● ?○ ?■ ?□)
   "Characters for unordered list bullets at each nesting level.")
 
-(defvar markdown-modern-render--checkbox-chars
+(defvar-local markdown-modern-render--checkbox-chars
   '((unchecked . ?☐)
     (checked . ?☑)
     (partial . ?☒))
   "Characters for task list checkboxes.")
 
-(defvar markdown-modern-render--hr-char ?─
+(defvar-local markdown-modern-render--hr-char ?─
   "Character used for horizontal rules.")
 
 (defvar markdown-modern-render--table-chars
@@ -119,10 +129,10 @@
     (t-left . ?┤))
   "Characters for table borders.")
 
-(defvar markdown-modern-render--blockquote-char ?▌
+(defvar-local markdown-modern-render--blockquote-char ?▌
   "Character for blockquote left border.")
 
-(defvar markdown-modern-render--newline-mark "↵"
+(defvar-local markdown-modern-render--newline-mark "↵"
   "String that marks a source newline in the paragraph being edited.")
 
 ;;; Initialization
@@ -131,6 +141,7 @@
   "Initialize the rendering engine for current buffer."
   (setq markdown-modern-render--owner (current-buffer))
   (setq markdown-modern-render--tables nil)
+  (setq markdown-modern-render--media nil)
   (setq markdown-modern-render--changed-overlays nil)
   (add-hook 'before-change-functions #'markdown-modern-render--before-change nil t)
   (add-hook 'after-change-functions #'markdown-modern-render--after-change nil t)
@@ -140,31 +151,76 @@
   (setq markdown-modern-render--unfolded nil)
   (markdown-modern-render--setup-display-chars))
 
-(defun markdown-modern-render--setup-display-chars ()
-  "Set up display characters based on environment."
-  (cond
-   ;; GUI Emacs - use Unicode
-   ((display-graphic-p)
-    (setq markdown-modern-render--bullet-chars '(?● ?○ ?■ ?□))
-    (setq markdown-modern-render--checkbox-chars '((unchecked . ?☐) (checked . ?☑)))
-    (setq markdown-modern-render--hr-char ?─)
-    (setq markdown-modern-render--blockquote-char ?▌)
-    (setq markdown-modern-render--newline-mark "↵"))
-   ;; Terminal with Unicode
-   ((char-displayable-p ?●)
-    (setq markdown-modern-render--bullet-chars '(?● ?○ ?◆ ?◇))
-    (setq markdown-modern-render--checkbox-chars '((unchecked . ?☐) (checked . ?☑)))
-    (setq markdown-modern-render--hr-char ?─)
-    (setq markdown-modern-render--blockquote-char ?│)
-    (setq markdown-modern-render--newline-mark
-          (if (char-displayable-p ?↵) "↵" "$")))
-   ;; Basic ASCII terminal
-   (t
-    (setq markdown-modern-render--bullet-chars '(?* ?- ?+ ?.))
-    (setq markdown-modern-render--checkbox-chars '((unchecked . ?\[) (checked . ?x)))
-    (setq markdown-modern-render--hr-char ?-)
-    (setq markdown-modern-render--blockquote-char ?|)
-    (setq markdown-modern-render--newline-mark "$"))))
+(defun markdown-modern-render--display-capabilities ()
+  "Return common display capabilities of windows actually showing this buffer.
+Use the least capable display for buffer-wide overlays.  A hidden buffer keeps
+its previous profile until displayed; an initial hidden buffer uses this frame."
+  (let ((windows (get-buffer-window-list (current-buffer) nil t)))
+    (if (and (null windows) markdown-modern-render--display-profile)
+        markdown-modern-render--display-profile
+      (let* ((frames (if windows (delete-dups (mapcar #'window-frame windows))
+                       (list (selected-frame))))
+             (graphic (cl-every #'display-graphic-p frames))
+             (unicode (cl-every (lambda (frame)
+                                  (with-selected-frame frame (char-displayable-p ?●))) frames))
+             (newline (cl-every (lambda (frame)
+                                  (with-selected-frame frame (char-displayable-p ?↵))) frames))
+             (images (cl-every #'display-images-p frames)))
+        (list (cond (graphic 'gui) (unicode 'unicode) (t 'ascii))
+              newline images (and images (image-type-available-p 'svg)))))))
+
+(defun markdown-modern-render--setup-display-chars (&optional profile)
+  "Set buffer-local glyphs from PROFILE or the current display capabilities."
+  (setq markdown-modern-render--display-profile
+        (or profile (markdown-modern-render--display-capabilities)))
+  (pcase (car markdown-modern-render--display-profile)
+    ('gui
+     (setq markdown-modern-render--bullet-chars '(?● ?○ ?■ ?□)
+           markdown-modern-render--checkbox-chars '((unchecked . ?☐) (checked . ?☑))
+           markdown-modern-render--hr-char ?─
+           markdown-modern-render--blockquote-char ?▌))
+    ('unicode
+     (setq markdown-modern-render--bullet-chars '(?● ?○ ?◆ ?◇)
+           markdown-modern-render--checkbox-chars '((unchecked . ?☐) (checked . ?☑))
+           markdown-modern-render--hr-char ?─
+           markdown-modern-render--blockquote-char ?│))
+    (_
+     (setq markdown-modern-render--bullet-chars '(?* ?- ?+ ?.)
+           markdown-modern-render--checkbox-chars '((unchecked . ?\[) (checked . ?x))
+           markdown-modern-render--hr-char ?-
+           markdown-modern-render--blockquote-char ?|)))
+  (setq markdown-modern-render--newline-mark
+        (if (nth 1 markdown-modern-render--display-profile) "↵" "$")))
+
+(defun markdown-modern-render--refresh-display ()
+  "Invalidate tracked rendering if this buffer's display capabilities changed."
+  (let ((old markdown-modern-render--display-profile)
+        (new (markdown-modern-render--display-capabilities)))
+    (unless (equal old new)
+      (markdown-modern-render--setup-display-chars new)
+      (let* ((glyph-change (not (equal (seq-take old 2) (seq-take new 2))))
+             (overlays (if glyph-change markdown-modern-render--overlays
+                         markdown-modern-render--media))
+             (ranges (sort (delq nil
+                                 (mapcar (lambda (ov)
+                                           (when (eq (overlay-buffer ov) (current-buffer))
+                                             (cons (overlay-start ov) (overlay-end ov)))) overlays))
+                           (lambda (a b) (< (car a) (car b)))))
+             lo hi)
+        ;; Merge the already-rendered extents.  No parsing or synchronous
+        ;; rendering is needed, including for media currently off screen.
+        (dolist (range ranges)
+          (if (and hi (<= (car range) hi))
+              (setq hi (max hi (cdr range)))
+            (when hi (jit-lock-refontify lo hi))
+            (setq lo (car range) hi (cdr range))))
+        (when hi (jit-lock-refontify lo hi))))))
+
+(defun markdown-modern-render--media-anchor (start end)
+  "Track a media extent START..END even while it is displayed as source."
+  (let ((ov (markdown-modern-render--get-overlay start end)))
+    (overlay-put ov 'markdown-modern-type 'media-region)
+    (push ov markdown-modern-render--media)))
 
 ;;; Overlay Management
 
@@ -198,6 +254,8 @@
           (delq ov markdown-modern-render--active-soft-breaks)
           markdown-modern-render--tables
           (delq ov markdown-modern-render--tables)
+          markdown-modern-render--media
+          (delq ov markdown-modern-render--media)
           markdown-modern-render--overlays
           (delq ov markdown-modern-render--overlays))
     (delete-overlay ov)
@@ -208,15 +266,14 @@
 (defun markdown-modern-render--before-change (start end)
   "Remember overlays in START..END that could evaporate during an edit."
   (when (eq markdown-modern-render--owner (current-buffer))
-    (setq markdown-modern-render--changed-overlays (overlays-in start end))))
+    (push (overlays-in start end) markdown-modern-render--changed-overlays)))
 
 (defun markdown-modern-render--after-change (&rest _)
   "Recycle overlays evaporated by the preceding change, without a buffer scan."
   (when (eq markdown-modern-render--owner (current-buffer))
-    (dolist (ov markdown-modern-render--changed-overlays)
+    (dolist (ov (pop markdown-modern-render--changed-overlays))
       (unless (overlay-buffer ov)
-        (markdown-modern-render--release-overlay ov)))
-    (setq markdown-modern-render--changed-overlays nil)))
+        (markdown-modern-render--release-overlay ov)))))
 
 (defun markdown-modern-render--clear-region (start end)
   "Clear markdown-modern overlays and URL metadata from START to END."
@@ -237,6 +294,7 @@
     (setq markdown-modern-render--overlays nil
           markdown-modern-render--overlay-pool nil
           markdown-modern-render--tables nil
+          markdown-modern-render--media nil
           markdown-modern-render--changed-overlays nil
           markdown-modern-render--active-soft-breaks nil
           markdown-modern-render--unfolded nil)))
@@ -354,7 +412,8 @@ even when the surrounding inline markup is revealed."
       (ignore-errors
         (markdown-modern-render--render-element inline-elem)))
     (when markdown-modern-join-paragraph-lines
-      (markdown-modern-render--soft-breaks start end inlines))))
+      (markdown-modern-render--soft-breaks start end inlines))
+    (markdown-modern-render--list-paragraph-prefix elem)))
 
 (defun markdown-modern-render--soft-breaks (start end inlines)
   "Display ordinary paragraph newlines in START..END as spaces.
@@ -842,7 +901,10 @@ For a line range, navigate to its first line."
           (let* ((alt-text (match-string 1))
                  (image-path (match-string 2))
                  (full-path (markdown-modern-render--resolve-image-path image-path)))
+            (markdown-modern-render--media-anchor start end)
             (cond
+             ((not (nth 2 markdown-modern-render--display-profile))
+              (markdown-modern-render--image-placeholder start end alt-text image-path))
              ;; Local file exists - display directly
              ((and full-path
                    (not (markdown-modern-render--url-p image-path))
@@ -880,43 +942,62 @@ For a line range, navigate to its first line."
     (overlay-put ov 'display
                  (propertize (format "[Image: %s]" (or alt-text image-path))
                             'face 'markdown-modern-image-alt))
-    (overlay-put ov 'markdown-modern-type 'image-placeholder)))
+    (overlay-put ov 'markdown-modern-type 'image-placeholder)
+    (overlay-put ov 'markdown-modern-image-url image-path)
+    ov))
 
 (defun markdown-modern-render--fetch-image-async (url cache-file buffer start end alt-text)
-  "Fetch image from URL asynchronously, cache to CACHE-FILE, then display.
-The image replaces the placeholder overlay between START and END in BUFFER;
-ALT-TEXT is used for the tooltip."
+  "Fetch URL into CACHE-FILE and update its original placeholder in BUFFER.
+START and END identify the image when the request starts.  The overlay follows
+edits; its request token and source text prevent updating recycled/replaced
+placeholders.  ALT-TEXT supplies the tooltip."
   (require 'url)
-  (url-retrieve
-   url
-   (lambda (status)
-     (unwind-protect
-         (if (plist-get status :error)
-             (message "markdown-modern: Failed to fetch image: %s" url)
-           ;; Skip HTTP headers
-           (goto-char (point-min))
-           (when (re-search-forward "\r?\n\r?\n" nil t)
-             ;; Write binary data directly to cache file
-             (let ((body-start (point))
-                   (coding-system-for-write 'binary))
-               (set-buffer-multibyte nil)
-               (write-region body-start (point-max) cache-file nil 'silent))
-             ;; Update the overlay in the original buffer
-             (when (and (file-exists-p cache-file)
-                        (> (file-attribute-size (file-attributes cache-file)) 0)
-                        (buffer-live-p buffer))
-               (with-current-buffer buffer
-                 ;; Find and replace the placeholder overlay
-                 (dolist (ov (overlays-in start end))
-                   (when (eq (overlay-get ov 'markdown-modern-type) 'image-placeholder)
-                     (let ((image (create-image cache-file nil nil
+  (let* ((placeholder
+          (with-current-buffer buffer
+            (cl-find-if
+             (lambda (ov)
+               (and (eq (overlay-get ov 'markdown-modern-owner) buffer)
+                    (eq (overlay-get ov 'markdown-modern-type) 'image-placeholder)
+                    (equal (overlay-get ov 'markdown-modern-image-url) url)))
+             (overlays-in start end))))
+         (source (with-current-buffer buffer
+                   (buffer-substring-no-properties start end)))
+         (request (list url)))
+    (when placeholder
+      (overlay-put placeholder 'markdown-modern-image-request request))
+    (url-retrieve
+     url
+     (lambda (status)
+       (unwind-protect
+           (if (plist-get status :error)
+               (message "markdown-modern: Failed to fetch image: %s" url)
+             (goto-char (point-min))
+             (when (re-search-forward "\r?\n\r?\n" nil t)
+               (let ((body-start (point)) (coding-system-for-write 'binary))
+                 (set-buffer-multibyte nil)
+                 (write-region body-start (point-max) cache-file nil 'silent))
+               (when (and (file-exists-p cache-file)
+                          (> (file-attribute-size (file-attributes cache-file)) 0)
+                          (buffer-live-p buffer) placeholder)
+                 (with-current-buffer buffer
+                   (when (and markdown-modern--rendering-enabled
+                              markdown-modern-display-images
+                              (nth 2 markdown-modern-render--display-profile)
+                              (eq markdown-modern-render--owner buffer)
+                              (eq (overlay-buffer placeholder) buffer)
+                              (eq (overlay-get placeholder 'markdown-modern-owner) buffer)
+                              (eq (overlay-get placeholder 'markdown-modern-image-request) request)
+                              (eq (overlay-get placeholder 'markdown-modern-type) 'image-placeholder)
+                              (equal source (buffer-substring-no-properties
+                                             (overlay-start placeholder) (overlay-end placeholder))))
+                     (overlay-put placeholder 'display
+                                  (create-image cache-file nil nil
                                                 :max-width markdown-modern-image-max-width
-                                                :max-height markdown-modern-image-max-height)))
-                       (overlay-put ov 'display image)
-                       (overlay-put ov 'help-echo (format "%s\n%s" alt-text url))
-                       (overlay-put ov 'markdown-modern-type 'image))))))))
-       (kill-buffer)))
-   nil t t))
+                                                :max-height markdown-modern-image-max-height))
+                     (overlay-put placeholder 'help-echo (format "%s\n%s" alt-text url))
+                     (overlay-put placeholder 'markdown-modern-type 'image))))))
+         (kill-buffer)))
+     nil t t)))
 
 (defun markdown-modern-render--resolve-image-path (path)
   "Resolve image PATH relative to current buffer's directory."
@@ -1135,81 +1216,100 @@ Dispatches to mermaid renderer for mermaid code blocks."
     (when (and mode (fboundp mode))
       mode)))
 
+(defun markdown-modern-render--line-prefix ()
+  "Return (CONTENT . TOKENS) for leading container syntax on this source line.
+Tokens are (TYPE START END); TYPE is `quote' or `list'.  Parsing context at the
+content position determines which of these prefixes are actual containers."
+  (save-excursion
+    (beginning-of-line)
+    (let (tokens more)
+      (setq more t)
+      (while more
+        (skip-chars-forward " \t" (line-end-position))
+        (cond
+         ((looking-at ">[ \t]?")
+          (push (list 'quote (point) (match-end 0)) tokens)
+          (goto-char (match-end 0)))
+         ((looking-at "\\(?:[-*+]\\|[0-9]+[.)]\\)[ \t]+")
+          (push (list 'list (point) (match-end 0)) tokens)
+          (goto-char (match-end 0)))
+         (t (setq more nil))))
+      (cons (point) (nreverse tokens)))))
+
+(defun markdown-modern-render--prefix-string (end)
+  "Return the displayed container indentation before END on its source line."
+  (let* ((raw (buffer-substring-no-properties
+               (save-excursion (goto-char end) (line-beginning-position)) end))
+         ;; Preserve the existing three-column task-widget continuation indent.
+         (raw (replace-regexp-in-string "[-*+][ \t]+\\[[ xX]\\][ \t]+" "   " raw)))
+    (apply #'string
+           (mapcar (lambda (char)
+                     (cond ((eq char ?>) markdown-modern-render--blockquote-char)
+                           ((memq char '(?\s ?\t)) char)
+                           (t ?\s)))
+                   (string-to-list raw)))))
+
+(defun markdown-modern-render--quote-depth (pos)
+  "Return the number of enclosing quote nodes at POS."
+  (let ((node (treesit-node-on pos (min (point-max) (1+ pos))
+                               markdown-modern-ts--parser t))
+        (depth 0))
+    (while node
+      (when (equal (treesit-node-type node) "block_quote") (cl-incf depth))
+      (setq node (treesit-node-parent node)))
+    depth))
+
+(defun markdown-modern-render--list-paragraph-prefix (elem)
+  "Apply list continuation indentation throughout paragraph ELEM."
+  (let ((node (treesit-node-parent (markdown-modern-node-treesit-node elem))))
+    (while (and node (not (equal (treesit-node-type node) "list_item")))
+      (setq node (treesit-node-parent node)))
+    (when node
+      (let* ((start (markdown-modern-node-start elem))
+             (node (markdown-modern-node-treesit-node elem))
+             (last (treesit-node-child node (1- (treesit-node-child-count node))))
+             (end (if (and last (equal (treesit-node-type last) "block_continuation"))
+                      (treesit-node-start last)
+                    (markdown-modern-node-end elem)))
+             (prefix (concat (make-string markdown-modern-left-margin ?\s)
+                             (markdown-modern-render--prefix-string start))))
+        (when (< start end)
+          (let ((ov (markdown-modern-render--get-overlay start end)))
+            (overlay-put ov 'wrap-prefix prefix)
+            (overlay-put ov 'priority 10)
+            (overlay-put ov 'markdown-modern-type 'list-content)))))))
+
 (defun markdown-modern-render--blockquote (elem)
-  "Render blockquote element ELEM.
-Uses simple styling that works well with `visual-line-mode' wrapping.
-Also handles list items inside blockquotes."
+  "Render quote prefixes within ELEM's current rendering extent."
   (let ((start (max (markdown-modern-node-start elem)
                     (or (car markdown-modern-render--region) (point-min))))
         (end (min (markdown-modern-node-end elem)
-                  (or (cdr markdown-modern-render--region) (point-max))))
-        ;; Get the base indentation from the buffer's line-prefix
-        (base-indent (or (and (boundp 'markdown-modern-left-margin)
-                              (make-string markdown-modern-left-margin ?\s))
-                         "")))
-    ;; Process each line
+                  (or (cdr markdown-modern-render--region) (point-max)))))
     (save-excursion
       (goto-char start)
+      (beginning-of-line)
       (while (< (point) end)
-        (when (looking-at "^\\(>+\\)[ \t]?")
-          (let* ((marker-start (match-beginning 1))
-                 (marker-end (match-end 0))
-                 (level (length (match-string 1)))
-                 (eol (line-end-position))
-                 ;; Build the prefix string for the blockquote bar
-                 (bar-str (propertize (concat (make-string level markdown-modern-render--blockquote-char) " ")
-                                      'face 'markdown-modern-blockquote-marker))
-                 ;; Full wrap prefix includes base indentation
-                 (full-bar-str (concat base-indent bar-str)))
-            ;; Replace > markers with styled block character
-            (let ((ov (markdown-modern-render--get-overlay marker-start marker-end)))
-              (overlay-put ov 'display bar-str)
-              (overlay-put ov 'markdown-modern-type 'quote-marker))
-            ;; Check if this line has a list item inside the blockquote
-            (when (< marker-end eol)
-              (goto-char marker-end)
-              (cond
-               ;; Unordered list item: > - item or > * item
-               ((looking-at "\\([-*+]\\)[ \t]+")
-                (let* ((list-marker-start (match-beginning 1))
-                       (list-marker-end (match-end 1))
-                       (content-start (match-end 0))
-                       (bullet (nth 0 markdown-modern-render--bullet-chars))
-                       ;; Wrap prefix: base indent + bar + space for bullet alignment
-                       (wrap-str (concat full-bar-str "  ")))
-                  ;; Replace - with bullet
-                  (let ((ov (markdown-modern-render--get-overlay list-marker-start list-marker-end)))
-                    (overlay-put ov 'display (propertize (string bullet)
-                                                         'face 'markdown-modern-list-bullet))
-                    (overlay-put ov 'markdown-modern-type 'list-marker))
-                  ;; Apply face to content with wrap-prefix for line continuation
-                  (let ((ov (markdown-modern-render--get-overlay content-start eol)))
-                    (overlay-put ov 'face 'markdown-modern-blockquote)
-                    (overlay-put ov 'wrap-prefix wrap-str)
-                    (overlay-put ov 'markdown-modern-type 'blockquote-list-content))))
-               ;; Ordered list item: > 1. item
-               ((looking-at "\\([0-9]+\\)[.)][ \t]+")
-                (let* ((num-start (match-beginning 1))
-                       (num-end (match-end 0))
-                       (content-start (match-end 0))
-                       ;; Wrap prefix: base indent + bar + space for number alignment
-                       (wrap-str (concat full-bar-str "   ")))
-                  ;; Style the number
-                  (let ((ov (markdown-modern-render--get-overlay num-start num-end)))
-                    (overlay-put ov 'face 'markdown-modern-list-number)
-                    (overlay-put ov 'markdown-modern-type 'list-marker))
-                  ;; Apply face to content with wrap-prefix
-                  (let ((ov (markdown-modern-render--get-overlay content-start eol)))
-                    (overlay-put ov 'face 'markdown-modern-blockquote)
-                    (overlay-put ov 'wrap-prefix wrap-str)
-                    (overlay-put ov 'markdown-modern-type 'blockquote-list-content))))
-               ;; Regular blockquote content (no list)
-               (t
-                (let ((ov (markdown-modern-render--get-overlay marker-end eol)))
-                  (overlay-put ov 'face 'markdown-modern-blockquote)
-                  ;; Wrap prefix shows bar on continuation lines
-                  (overlay-put ov 'wrap-prefix full-bar-str)
-                  (overlay-put ov 'markdown-modern-type 'blockquote-content)))))))
+        (let* ((parts (markdown-modern-render--line-prefix))
+               (quotes (seq-filter (lambda (token) (eq (car token) 'quote)) (cdr parts)))
+               (depth (markdown-modern-render--quote-depth (min (car parts) (1- end))))
+               (quotes (seq-take quotes depth))
+               (content (nth 2 (car (last quotes))))
+               (eol (line-end-position)))
+          (dolist (token quotes)
+            (let ((ov (markdown-modern-render--get-overlay (nth 1 token) (nth 2 token))))
+              (overlay-put ov 'display
+                           (propertize (concat (string markdown-modern-render--blockquote-char)
+                                               (buffer-substring-no-properties
+                                                (1+ (nth 1 token)) (nth 2 token)))
+                                       'face 'markdown-modern-blockquote-marker))
+              (overlay-put ov 'markdown-modern-type 'quote-marker)))
+          (when (and content (< content eol))
+            (let ((ov (markdown-modern-render--get-overlay content eol)))
+              (overlay-put ov 'face 'markdown-modern-blockquote)
+              (overlay-put ov 'wrap-prefix
+                           (concat (make-string markdown-modern-left-margin ?\s)
+                                   (markdown-modern-render--prefix-string content)))
+              (overlay-put ov 'markdown-modern-type 'blockquote-content))))
         (forward-line 1)))))
 
 (defun markdown-modern-render--list (elem)
@@ -1272,100 +1372,53 @@ recognize only the checkbox itself as an interactive widget."
     ov))
 
 (defun markdown-modern-render--list-item (elem)
-  "Render list item element ELEM.
-Includes `wrap-prefix' for proper line continuation."
-  (let ((start (markdown-modern-node-start elem))
-        (_end (markdown-modern-node-end elem))
-        ;; Get the base indentation from the buffer's line-prefix
-        (base-indent (or (and (boundp 'markdown-modern-left-margin)
-                              (make-string markdown-modern-left-margin ?\s))
-                         "")))
-    (save-excursion
-      (goto-char start)
-      (cond
-       ;; Task list item
-       ((looking-at "^\\([ \t]*\\)\\([-*+]\\)[ \t]+\\(\\[[ xX]\\]\\)[ \t]+")
-        (let* ((indent (match-string 1))
-               (marker-start (match-beginning 2))
-               (checkbox-start (match-beginning 3))
-               (checkbox-end (match-end 3))
-               (content-start (match-end 0))
-               (checkbox-text (match-string 3))
-               (is-checked (string-match-p "[xX]" checkbox-text))
-               (_level (/ (length indent) 2))
-               (eol (line-end-position))
-               ;; Wrap prefix: base indent + list indent + space for checkbox alignment
-               (wrap-str (concat base-indent indent
-                                 (propertize "  " 'face 'fixed-pitch))))
-          ;; Hide list marker
-          (let ((ov (markdown-modern-render--get-overlay marker-start checkbox-start)))
-            (overlay-put ov 'display "")
-            (overlay-put ov 'markdown-modern-type 'list-marker))
-          ;; Render checkbox
-          (let ((ov (markdown-modern-render--list-marker
-                     checkbox-start checkbox-end content-start
-                     (cdr (assq (if is-checked 'checked 'unchecked)
-                                markdown-modern-render--checkbox-chars))
-                     (if is-checked 'markdown-modern-task-checked
-                       'markdown-modern-task-unchecked))))
-            (overlay-put ov 'markdown-modern-type 'checkbox)
-            (overlay-put ov 'markdown-modern-checkbox-state (if is-checked 'checked 'unchecked)))
-          ;; Use the same font for the marker and gap as ordinary bullets.
-          (let ((ov (markdown-modern-render--get-overlay checkbox-start content-start)))
-            (overlay-put ov 'face 'fixed-pitch)
-            (overlay-put ov 'markdown-modern-type 'list-marker-slot))
-          ;; Add wrap-prefix to content
-          (when (< content-start eol)
-            (let ((ov (markdown-modern-render--get-overlay content-start eol)))
-              (overlay-put ov 'wrap-prefix wrap-str)
-              (overlay-put ov 'markdown-modern-type 'list-content)))))
-       ;; Unordered list item
-       ((looking-at "^\\([ \t]*\\)\\([-*+]\\)[ \t]+")
-        (let* ((indent (match-string 1))
-               (marker-start (match-beginning 2))
-               (marker-end (match-end 2))
-               (content-start (match-end 0))
-               (level (/ (length indent) 2))
-               (bullet (nth (mod level (length markdown-modern-render--bullet-chars))
-                           markdown-modern-render--bullet-chars))
-               (eol (line-end-position))
-               ;; Wrap prefix: base indent + list indent + space for bullet alignment
-               (wrap-str (concat base-indent indent
-                                 (propertize "  " 'face 'fixed-pitch))))
-          ;; Replace marker with bullet
-          (let ((ov (markdown-modern-render--list-marker
-                     marker-start marker-end content-start bullet
-                     'markdown-modern-list-bullet)))
-            (overlay-put ov 'markdown-modern-type 'list-marker))
-          ;; Keep the source marker and gap monospaced on reveal: together
-          ;; they occupy the same width as the padded marker above.
-          (let ((ov (markdown-modern-render--get-overlay marker-start content-start)))
-            (overlay-put ov 'face 'fixed-pitch)
-            (overlay-put ov 'markdown-modern-type 'list-marker-slot))
-          ;; Add wrap-prefix to content
-          (when (< content-start eol)
-            (let ((ov (markdown-modern-render--get-overlay content-start eol)))
-              (overlay-put ov 'wrap-prefix wrap-str)
-              (overlay-put ov 'markdown-modern-type 'list-content)))))
-       ;; Ordered list item
-       ((looking-at "^\\([ \t]*\\)\\([0-9]+\\)\\([.):]\\)[ \t]+")
-        (let* ((indent (match-string 1))
-               (number (match-string 2))
-               (marker-start (match-beginning 2))
-               (marker-end (match-end 3))
-               (content-start (match-end 0))
-               (eol (line-end-position))
-               ;; Wrap prefix: base indent + list indent + space for number alignment
-               (wrap-str (concat base-indent indent (make-string (+ 2 (length number)) ?\s))))
-          ;; Style number
-          (let ((ov (markdown-modern-render--get-overlay marker-start marker-end)))
+  "Render ELEM's marker at its parser position, including quoted/nested items.
+Paragraph renderers handle continuation indentation independently of markers."
+  (save-excursion
+    (goto-char (markdown-modern-node-start elem))
+    (when (looking-at "\\([-*+]\\|[0-9]+[.):]\\)[ \t]+")
+      (let* ((start (point))
+             (marker (match-string 1))
+             (marker-end (match-end 1))
+             (slot-end (match-end 0))
+             (ordered (string-match-p "[0-9]" marker)))
+        (goto-char slot-end)
+        (cond
+         ((looking-at "\\(\\[[ xX]\\]\\)[ \t]+")
+          (let* ((checkbox-start (match-beginning 1))
+                 (checkbox-end (match-end 1))
+                 (checked (string-match-p "[xX]" (match-string 1)))
+                 (hide (markdown-modern-render--get-overlay start slot-end))
+                 (box (markdown-modern-render--get-overlay checkbox-start checkbox-end)))
+            (overlay-put hide 'display "")
+            (overlay-put hide 'markdown-modern-type 'list-marker)
+            (overlay-put box 'display
+                         (propertize
+                          (string (cdr (assq (if checked 'checked 'unchecked)
+                                            markdown-modern-render--checkbox-chars)))
+                          'face (if checked 'markdown-modern-task-checked
+                                  'markdown-modern-task-unchecked)))
+            (overlay-put box 'markdown-modern-type 'checkbox)
+            (overlay-put box 'markdown-modern-checkbox-state (if checked 'checked 'unchecked))))
+         (ordered
+          (let ((ov (markdown-modern-render--get-overlay start marker-end)))
             (overlay-put ov 'face 'markdown-modern-list-number)
-            (overlay-put ov 'markdown-modern-type 'list-marker))
-          ;; Add wrap-prefix to content
-          (when (< content-start eol)
-            (let ((ov (markdown-modern-render--get-overlay content-start eol)))
-              (overlay-put ov 'wrap-prefix wrap-str)
-              (overlay-put ov 'markdown-modern-type 'list-content)))))))))
+            (overlay-put ov 'markdown-modern-type 'list-marker)))
+         (t
+          (let ((node (markdown-modern-node-treesit-node elem)) (level -1))
+            (while node
+              (when (equal (treesit-node-type node) "list") (cl-incf level))
+              (setq node (treesit-node-parent node)))
+            (let ((ov (markdown-modern-render--get-overlay start marker-end))
+                  (slot (markdown-modern-render--get-overlay start slot-end)))
+              (overlay-put ov 'display
+                           (propertize
+                            (string (nth (mod (max 0 level) (length markdown-modern-render--bullet-chars))
+                                         markdown-modern-render--bullet-chars))
+                            'face 'markdown-modern-list-bullet))
+              (overlay-put ov 'markdown-modern-type 'list-marker)
+              (overlay-put slot 'face 'fixed-pitch)
+              (overlay-put slot 'markdown-modern-type 'list-marker-slot)))))))))
 
 (defun markdown-modern-render--hr (elem)
   "Render horizontal rule element ELEM.
@@ -1478,7 +1531,8 @@ WINDOW supplies the frame and font metrics when non-nil."
                   (ignore-errors (window-font-width nil 'markdown-modern-table))
                   (and (fboundp 'frame-char-width) (frame-char-width (and window (window-frame window))))
                   8))
-        (scale (if (and (boundp 'text-scale-mode-amount)
+        (scale (if (and (bound-and-true-p text-scale-mode)
+                        (boundp 'text-scale-mode-amount)
                         (boundp 'text-scale-mode-step)
                         (numberp text-scale-mode-amount)
                         (not (zerop text-scale-mode-amount)))
@@ -1712,61 +1766,57 @@ row, recomputing the padding for the cell's new content width."
               (overlay-put ov 'markdown-modern-type 'table-edit))))
         (setq col (1+ col) ps (cdr ps))))))
 
+(defun markdown-modern-render--table-line-start ()
+  "Return this line's first table pipe after container prefixes, or nil."
+  (save-excursion
+    (goto-char (car (markdown-modern-render--line-prefix)))
+    (when (looking-at "|.+|[ \t]*$") (point))))
+
 (defun markdown-modern-render--table (elem)
-  "Render table element ELEM using per-row overlays for reliable display.
-Always finds the COMPLETE table by scanning beyond element boundaries."
-  (let ((start (markdown-modern-node-start elem))
-        (rows nil)
-        (row-info nil))
+  "Render all rows of ELEM, preserving surrounding container prefixes."
+  (let ((start (markdown-modern-node-start elem)) rows row-info prefix)
     (save-excursion
-      ;; Find the true start of the table (scan backwards)
       (goto-char start)
       (beginning-of-line)
-      (while (and (not (bobp))
-                  (save-excursion
-                    (forward-line -1)
-                    (looking-at "^[ \t]*|.+|[ \t]*$")))
-        (forward-line -1))
-      ;; Now scan forward to collect ALL rows (no end limit)
-      (let ((is-header t)
-            (seen-separator nil)
-            (keep-going t))
-        (while (and keep-going (looking-at "^[ \t]*|.+|[ \t]*$"))
+      (let ((header t) (seen-separator nil) (more t) row-start)
+        (while (and more (not (eobp))
+                    (setq row-start (markdown-modern-render--table-line-start))
+                    (or (null prefix)
+                        (equal prefix (markdown-modern-render--prefix-string row-start))))
+          (setq prefix (markdown-modern-render--prefix-string row-start))
           (let* ((bol (line-beginning-position))
                  (eol (line-end-position))
-                 (line (buffer-substring-no-properties bol eol))
+                 (line (buffer-substring-no-properties row-start eol))
                  (cells (markdown-modern-render--table-parse-row line))
-                 (is-sep (and cells (string-match-p "^[ \t]*|[-:|]+|" line))))
+                 (separator (and cells (string-match-p "^[ \t]*|[-:|]+|" line))))
             (when cells
               (push cells rows)
-              (push (list bol eol is-sep
-                          (and is-header (not is-sep) (not seen-separator)))
-                    row-info)
-              (when is-sep (setq seen-separator t))
-              (when (and (not is-sep) seen-separator)
-                (setq is-header nil))))
-          (if (= (forward-line 1) 1)
-              (setq keep-going nil))))
-      (setq rows (nreverse rows))
-      (setq row-info (nreverse row-info))
-      ;; Clear overlays in the full table region (properly tracked).  Extend one
-      ;; past the last row's end so the zero-length bottom-border overlay (an
-      ;; `after-string' at that position) is also released on re-render.
+              ;; Retain both the body start and source BOL for virtual borders.
+              (push (list row-start eol separator (and header (not separator)
+                                                       (not seen-separator)) bol prefix) row-info)
+              (when separator (setq seen-separator t))
+              (when (and (not separator) seen-separator) (setq header nil))))
+          (unless (zerop (forward-line 1)) (setq more nil))))
+      (setq rows (nreverse rows) row-info (nreverse row-info))
       (when row-info
-        (let ((table-start (nth 0 (car row-info)))
-              (table-end (min (1+ (nth 1 (car (last row-info)))) (point-max))))
-          (markdown-modern-render--clear-region table-start table-end)))
-      ;; Create per-row overlays
-      (when (and rows row-info)
-        (let ((widths (markdown-modern-render--table-column-widths rows)))
-          (when widths
-            (let ((anchor (markdown-modern-render--get-overlay
-                           (caar row-info)
-                           (min (point-max) (1+ (nth 1 (car (last row-info))))))))
-              (overlay-put anchor 'markdown-modern-type 'table-region)
-              (push anchor markdown-modern-render--tables))
-            (markdown-modern-render--table-create-overlays
-             rows row-info widths)))))))
+        (let ((lo (nth 4 (car row-info)))
+              (hi (min (point-max) (1+ (nth 1 (car (last row-info)))))))
+          ;; The region renderer has already drawn quote/list prefixes.  Clear
+          ;; only table overlays here, including any extra empty source rows.
+          (dolist (ov (overlays-in lo hi))
+            (when (memq (overlay-get ov 'markdown-modern-type)
+                        '(table table-edit table-grid-line table-region))
+              (markdown-modern-render--release-overlay ov)))
+          (let ((widths
+                 (let ((markdown-modern-table-max-width
+                        (or markdown-modern-table-max-width
+                            (max 1 (- (markdown-modern-render--table-display-width)
+                                      (string-width prefix))))))
+                   (markdown-modern-render--table-column-widths rows)))
+                (anchor (markdown-modern-render--get-overlay lo hi)))
+            (overlay-put anchor 'markdown-modern-type 'table-region)
+            (push anchor markdown-modern-render--tables)
+            (markdown-modern-render--table-create-overlays rows row-info widths)))))))
 
 (defun markdown-modern-render--table-create-overlays (rows row-info widths)
   "Create overlays rendering table ROWS (ROW-INFO, WIDTHS) as a box grid.
@@ -1794,6 +1844,8 @@ push the box past the window width and wrap it."
     (dolist (info row-info)
       (let* ((bol (nth 0 info))
              (eol (nth 1 info))
+             (source-bol (or (nth 4 info) bol))
+             (prefix (or (nth 5 info) ""))
              (is-sep (nth 2 info))
              (is-hdr (nth 3 info))
              (is-first (= row-idx 0))
@@ -1808,10 +1860,12 @@ push the box past the window width and wrap it."
                           (>= (cdr reveal) bol))))
         ;; Top grid line above the first row.
         (when is-first
-          (markdown-modern-render--table-border-overlay bol top-border nil))
+          (markdown-modern-render--table-border-overlay
+           source-bol (concat prefix top-border) nil))
         ;; Divider above this row, between two consecutive data rows.
         (when (and (not is-first) (not is-sep) (not prev-is-sep))
-          (markdown-modern-render--table-border-overlay bol row-separator nil))
+          (markdown-modern-render--table-border-overlay
+           source-bol (concat prefix row-separator) nil))
         ;; The row itself: editable when active, boxed otherwise.
         (cond
          ((and active is-sep)
@@ -1833,12 +1887,16 @@ push the box past the window width and wrap it."
             ;; instead inherits the margin uniformly (first and continuation
             ;; lines alike) and stays internally aligned; the fit budget in
             ;; `markdown-modern-render--table-display-width' reserves room for it.
+            (unless (string-empty-p prefix)
+              (setq formatted (replace-regexp-in-string "\n" (concat "\n" prefix) formatted t t))
+              (overlay-put ov 'wrap-prefix ""))
             (overlay-put ov 'display (propertize formatted 'face face))
             (overlay-put ov 'priority 200)
             (overlay-put ov 'markdown-modern-type 'table))))
         ;; Bottom grid line below the last row.
         (when is-last
-          (markdown-modern-render--table-border-overlay eol bottom-border t)))
+          (markdown-modern-render--table-border-overlay
+           eol (concat "\n" prefix (substring bottom-border 1)) t)))
       (setq row-idx (1+ row-idx)))))
 
 (defun markdown-modern-render--table-row (row)
@@ -2177,34 +2235,37 @@ hide opening $$ line, display converted content, hide closing $$ line."
   "Render Mermaid diagram element ELEM as inline SVG."
   (let ((start (markdown-modern-node-start elem))
         (end (markdown-modern-node-end elem)))
-    (save-excursion
-      (goto-char start)
-      (when (looking-at "^[ \t]*```mermaid[ \t]*\r?$")
-        (let* ((content-start (1+ (line-end-position)))
-               (content-end (save-excursion
-                              (goto-char end)
-                              (if (re-search-backward "^[ \t]*```[ \t]*\r?$" content-start t)
-                                  (match-beginning 0)
-                                end)))
-               (diagram-code (buffer-substring-no-properties content-start content-end))
-               (cache-key (md5 diagram-code))
-               (svg-string (or (gethash cache-key (markdown-modern-render--mermaid-cache))
-                               (let ((svg (condition-case err
-                                              (markdown-modern-mermaid-render diagram-code)
-                                            (error
-                                             (message "markdown-modern: mermaid render error: %s" (error-message-string err))
-                                             nil))))
-                                 (when svg
-                                   (puthash cache-key svg (markdown-modern-render--mermaid-cache)))
-                                 svg))))
-          (if svg-string
-              (condition-case img-err
-                  (markdown-modern-render--display-mermaid-svg start end svg-string cache-key)
-                (error
-                 (message "markdown-modern: mermaid SVG display error: %s" (error-message-string img-err))
-                 (markdown-modern-render--mermaid-source-fallback elem)))
-            ;; Unsupported diagram type or error - show as styled code block
-            (markdown-modern-render--mermaid-source-fallback elem)))))))
+    (markdown-modern-render--media-anchor start end)
+    (if (not (nth 3 markdown-modern-render--display-profile))
+        (markdown-modern-render--mermaid-source-fallback elem)
+      (save-excursion
+	(goto-char start)
+	(when (looking-at "^[ \t]*```mermaid[ \t]*\r?$")
+          (let* ((content-start (1+ (line-end-position)))
+		 (content-end (save-excursion
+				(goto-char end)
+				(if (re-search-backward "^[ \t]*```[ \t]*\r?$" content-start t)
+                                    (match-beginning 0)
+                                  end)))
+		 (diagram-code (buffer-substring-no-properties content-start content-end))
+		 (cache-key (md5 diagram-code))
+		 (svg-string (or (gethash cache-key (markdown-modern-render--mermaid-cache))
+				 (let ((svg (condition-case err
+						(markdown-modern-mermaid-render diagram-code)
+                                              (error
+                                               (message "markdown-modern: mermaid render error: %s" (error-message-string err))
+                                               nil))))
+                                   (when svg
+                                     (puthash cache-key svg (markdown-modern-render--mermaid-cache)))
+                                   svg))))
+            (if svg-string
+		(condition-case img-err
+                    (markdown-modern-render--display-mermaid-svg start end svg-string cache-key)
+                  (error
+                   (message "markdown-modern: mermaid SVG display error: %s" (error-message-string img-err))
+                   (markdown-modern-render--mermaid-source-fallback elem)))
+              ;; Unsupported diagram type or error - show as styled code block
+              (markdown-modern-render--mermaid-source-fallback elem))))))))
 
 (defun markdown-modern-render--display-mermaid-svg (start end svg-string &optional cache-key)
   "Display SVG-STRING as an inline image in region START to END.
@@ -2226,6 +2287,7 @@ an image only once per unique diagram, not on every render."
                         img))))
       (when image
         (markdown-modern-render--clear-region start end)
+        (markdown-modern-render--media-anchor start end)
         (let ((ov (markdown-modern-render--get-overlay start end)))
           (overlay-put ov 'display image)
           (overlay-put ov 'help-echo "Mermaid diagram (SVG)")

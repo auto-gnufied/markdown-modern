@@ -191,6 +191,16 @@ item.
 Plain prose is never disturbed, so moving the cursor through ordinary text does
 no work. There is no source/rendered toggle to manage.
 
+Nested list and quote markers stay rendered, and list continuation lines keep
+their indentation when a paragraph shows its source lines. Quoted tables keep
+their quote prefix alongside the grid.
+
+Marker glyphs and image fallbacks follow the capabilities of the displays
+showing a buffer. When GUI and terminal windows share a buffer, rendering uses
+their common capabilities. Display changes invalidate existing rendering for
+`jit-lock` to rebuild as needed; opening another buffer does not change the
+current buffer's glyphs.
+
 If a buffer has damaged rendering left over from an older package version,
 run `M-x markdown-modern-refresh` once. It clears package rendering and lets
 `jit-lock` rebuild the visible region, preserving source text and window margins.
