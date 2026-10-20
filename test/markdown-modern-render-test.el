@@ -74,6 +74,49 @@ Only the text that the edit marks for re-rendering is rendered again."
 
 ;;; Renderer assertions
 
+(ert-deftest render/html-comments ()
+  "Block and inline comments retain literal, styled source when revealed."
+  (dolist (text '("<!--\n**literal** [link](https://example.com)\n-->\n"
+                  "before <!-- **literal** --> after\n"
+                  "<!-- first --> <!-- second -->\n"
+                  "<!-- unfinished\ncomment\n"))
+    (markdown-modern-render-test--with text
+      (let ((comments (cl-remove-if-not
+                       (lambda (ov) (eq (overlay-get ov 'markdown-modern-type)
+                                        'comment))
+                       (overlays-in (point-min) (point-max)))))
+        (should comments)
+        (dolist (ov comments)
+          (should (eq (overlay-get ov 'face) 'markdown-modern-comment))
+          (should-not (overlay-get ov 'display)))
+        (should-not (markdown-modern-render-test--ov 'strong-content))
+        (should-not (markdown-modern-render-test--ov 'link))
+        (markdown-modern-render--reveal-markup (point-min) (point-max))
+        (should (markdown-modern-render-test--ov 'comment))
+        (should (equal (buffer-string) text))))))
+
+(ert-deftest render/html-comments-exclude-code-and-tags ()
+  "Comment-like text in code and ordinary HTML tags keep their own style."
+  (dolist (text '("`<!-- literal -->`\n"
+                  "```html\n<!-- literal -->\n```\n"
+                  "<div>ordinary HTML</div>\n"
+                  "before <span>ordinary HTML</span> after\n"))
+    (markdown-modern-render-test--with text
+      (should-not (markdown-modern-render-test--ov 'comment)))))
+
+(ert-deftest render/html-comment-partial-refresh ()
+  "Refreshing inside a multiline comment styles its entire extent once."
+  (markdown-modern-render-test--with "<!--\nfirst\nlast\n-->\n\nordinary\n"
+    (goto-char (point-min))
+    (search-forward "first")
+    (markdown-modern-render--render-region (1- (point)) (point))
+    (should (= (markdown-modern-render-test--count 'comment) 1))
+    (let ((ov (markdown-modern-render-test--ov 'comment)))
+      (should (= (overlay-start ov) (point-min)))
+      (should (equal (buffer-substring-no-properties (overlay-start ov)
+                                                    (overlay-end ov))
+                     "<!--\nfirst\nlast\n-->")))))
+
 (defun markdown-modern-render-test--assert-heading ()
   (markdown-modern-render-test--with "## A heading\n"
     (let ((marker (markdown-modern-render-test--ov 'heading-marker))

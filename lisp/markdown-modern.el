@@ -209,6 +209,11 @@ When enabled, the background color extends to the right margin."
   "Default face for markdown-modern content."
   :group 'markdown-modern-faces)
 
+(defface markdown-modern-comment
+  '((t :inherit font-lock-comment-face :slant italic))
+  "Face for HTML comments, including their delimiters."
+  :group 'markdown-modern-faces)
+
 (defface markdown-modern-heading-1
   '((t :height 1.8 :weight bold :inherit default))
   "Face for level 1 headings."

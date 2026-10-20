@@ -392,6 +392,7 @@ even when the surrounding inline markup is revealed."
       ('list-item (markdown-modern-render--list-item elem))
       ('hr (markdown-modern-render--hr elem))
       ('table (markdown-modern-render--table elem))
+      ((or 'html-block 'html-inline) (markdown-modern-render--html-comments elem))
       ;; Extended elements
       ('footnote-ref (markdown-modern-render--footnote-ref elem))
       ('math (markdown-modern-render--math elem))
@@ -402,6 +403,19 @@ even when the surrounding inline markup is revealed."
       (_ nil))))
 
 ;;; Paragraph Rendering
+
+(defun markdown-modern-render--html-comments (elem)
+  "Style comments within HTML ELEM without hiding their source text."
+  (save-excursion
+    (goto-char (markdown-modern-node-start elem))
+    (let ((end (markdown-modern-node-end elem)))
+      (while (search-forward "<!--" end t)
+        (let* ((start (- (point) 4))
+               (finish (if (search-forward "-->" end t) (point) end))
+               (ov (markdown-modern-render--get-overlay start finish)))
+          (overlay-put ov 'markdown-modern-type 'comment)
+          (overlay-put ov 'face 'markdown-modern-comment)
+          (goto-char finish))))))
 
 (defun markdown-modern-render--paragraph (elem)
   "Render paragraph ELEM by parsing and rendering its inline elements."

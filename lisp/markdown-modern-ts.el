@@ -136,6 +136,7 @@ Requires an Emacs build with Tree-sitter support, Git and a C compiler."
     ("task_list_marker_unchecked" . task-unchecked)
     ("thematic_break" . hr)
     ("html_block" . html-block)
+    ("html_tag" . html-inline)
     ("link_reference_definition" . link-ref-def)
     ("pipe_table" . table)
     ("pipe_table_header" . table-header)
@@ -408,10 +409,11 @@ viewport inside a large container does not require rendering the whole list."
         (type (treesit-node-type node)))
     (when (member type '("emphasis" "strong_emphasis" "strikethrough"
                         "code_span" "inline_link" "full_reference_link"
-                        "image" "uri_autolink" "email_autolink" "latex_block"))
+                        "image" "uri_autolink" "email_autolink" "latex_block"
+                        "html_tag"))
       (push node result))
     ;; Code and math contents stay literal, including Markdown delimiters.
-    (unless (member type '("code_span" "latex_block"))
+    (unless (member type '("code_span" "latex_block" "html_tag"))
       (dotimes (i (treesit-node-child-count node))
         (setq result (append result
                              (markdown-modern-ts--collect-inline-nodes

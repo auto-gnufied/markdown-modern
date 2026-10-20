@@ -306,6 +306,10 @@ All options are under `M-x customize-group RET markdown-modern RET`. The faces
 (`markdown-modern-heading-1` … `-6`, `-bold`, `-italic`, `-inline-code`,
 `-code-block`, `-table`, …) are under `markdown-modern-faces`.
 
+HTML comments (`<!-- … -->`) remain visible in italics using your theme's
+`font-lock-comment-face` color, including while editing. Customize
+`markdown-modern-comment` to change their appearance.
+
 ### Appearance
 
 | Variable | Default | Description |
