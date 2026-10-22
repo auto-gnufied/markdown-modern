@@ -162,5 +162,127 @@ The heading renderer must descend into its own inline markup."
       (should (= delims 4))
       (should (= contents 2)))))
 
+;;; Mouse wheel scrolling
+
+(ert-deftest jit/wheel-optional-amount ()
+  (let (calls)
+    (cl-letf (((symbol-function 'scroll-up)
+               (lambda (&optional amount) (push (list 'up amount) calls)))
+              ((symbol-function 'scroll-down)
+               (lambda (&optional amount) (push (list 'down amount) calls))))
+      (markdown-modern--wheel-up)
+      (markdown-modern--wheel-down)
+      (should (equal (nreverse calls) '((up nil) (down nil)))))))
+
+(ert-deftest jit/wheel-bounded-retry ()
+  (dolist (amount '(nil 0 1 -1 2 -2 100))
+    (let (calls)
+      (markdown-modern--wheel-scroll
+       (lambda (n) (push n calls)) amount)
+      (should (equal (nreverse calls)
+                     (if (memq amount '(1 -1))
+                         (list amount (* 2 amount)) (list amount)))))))
+
+(ert-deftest jit/wheel-no-retry-after-progress ()
+  (dolist (pixel-progress '(nil t))
+    (let ((start 1) (pixels 0) calls)
+      (cl-letf (((symbol-function 'window-start) (lambda (&rest _) start))
+                ((symbol-function 'window-vscroll) (lambda (&rest _) pixels)))
+        (markdown-modern--wheel-scroll
+         (lambda (n)
+           (push n calls)
+           (if pixel-progress (setq pixels 1) (setq start 2))) 1)
+        (should (equal calls '(1)))))))
+
+(ert-deftest jit/wheel-boundary-signals ()
+  (dolist (boundary '(beginning-of-buffer end-of-buffer))
+    (let ((calls 0))
+      (should-error
+       (markdown-modern--wheel-scroll
+        (lambda (_) (setq calls (1+ calls)) (signal boundary nil)) 1)
+       :type boundary)
+      (should (= calls 1)))))
+
+(ert-deftest jit/wheel-real-wheel-boundaries ()
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *wheel-boundary-regression*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (dotimes (n 200) (insert (format "Line %d\n" n)))
+            (set-buffer-modified-p nil)
+            (markdown-modern-mode)
+            (let ((mouse-wheel-follow-mouse nil)
+                  (mouse-wheel-progressive-speed nil)
+                  (mouse-wheel-scroll-amount '(1))
+                  (mouse-wheel-inhibit-click-time nil))
+              (dolist (direction '(wheel-up wheel-down))
+                (goto-char (if (eq direction 'wheel-up) (point-min) (point-max)))
+                (recenter)
+                (redisplay t)
+                ;; Exercise mwheel's zero-argument boundary recovery, repeatedly.
+                (dotimes (_ 10)
+                  (mwheel-scroll (list direction (posn-at-point)))
+                  (redisplay t))))
+            (should-not (buffer-modified-p)))
+        (kill-buffer buffer)))))
+
+(ert-deftest jit/wheel-rendered-row ()
+  (skip-unless (display-graphic-p))
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *wheel-rendered-row-regression*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "| table row |\n")
+            (dotimes (n 100) (insert (format "Line %d\n" n)))
+            (set-buffer-modified-p nil)
+            (let ((overlay (make-overlay (point-min)
+                                         (save-excursion (goto-char (point-min))
+                                                         (line-end-position)))))
+              (overlay-put overlay 'display "| wrapped table |\n| second line   |"))
+            (goto-char (point-min))
+            (set-window-start nil (point-min))
+            (redisplay t)
+            (let ((start (window-start)))
+              (scroll-up 1)
+              (redisplay t)
+              (goto-char (point-min))
+              (set-window-start nil start)
+              (redisplay t)
+              (markdown-modern--wheel-up 1)
+              (redisplay t)
+              (should (> (window-start) start)))
+            (should-not (buffer-modified-p)))
+        (kill-buffer buffer)))))
+
+(ert-deftest jit/wheel-preserve-screen-position-scoped ()
+  (let ((scroll-preserve-screen-position nil) seen)
+    (markdown-modern--wheel-scroll
+     (lambda (_) (setq seen scroll-preserve-screen-position)) nil)
+    (should (eq seen 'always))
+    (should-not scroll-preserve-screen-position)))
+
+(ert-deftest jit/wheel-mode-lifecycle ()
+  "Mode activation installs local callbacks and teardown releases them."
+  (with-temp-buffer
+    (insert "# Heading\n\nText.\n")
+    (markdown-modern-mode)
+    (should (local-variable-p 'mwheel-scroll-up-function))
+    (should (eq mwheel-scroll-up-function #'markdown-modern--wheel-up))
+    (should (eq mwheel-scroll-down-function #'markdown-modern--wheel-down))
+    (markdown-modern--teardown-buffer)
+    (should-not (local-variable-p 'mwheel-scroll-up-function))
+    (should-not (local-variable-p 'mwheel-scroll-down-function))))
+
+(ert-deftest jit/wheel-teardown-preserves-user-override ()
+  "Cleanup does not discard a callback changed after activation."
+  (with-temp-buffer
+    (markdown-modern-mode)
+    (setq-local mwheel-scroll-down-function #'ignore)
+    (markdown-modern--teardown-buffer)
+    (should (local-variable-p 'mwheel-scroll-down-function))
+    (should (eq mwheel-scroll-down-function #'ignore))))
+
 (provide 'markdown-modern-jit-test)
 ;;; markdown-modern-jit-test.el ends here

@@ -264,6 +264,14 @@ major modes.
 | `SPC` (on a checkbox) | `markdown-modern-space-or-toggle-checkbox` | Toggle the checkbox under point |
 | `Backspace`/`Delete` (on a checkbox) | `markdown-modern-checkbox-delete-{backward,forward}` | Remove the checkbox, keep the list item |
 
+### Mouse wheel scrolling
+
+Mouse wheel scrolling keeps the cursor at its screen position while moving
+through rendered text, avoiding jumps back to previously viewed sections.
+A one-line wheel step that stalls inside a rendered table is retried once
+with two lines. These adjustments apply only to Markdown Modern buffers;
+keyboard scrolling keeps your usual settings.
+
 ### Tables
 
 Tables render as a box-drawing grid that stays drawn while you edit: the row

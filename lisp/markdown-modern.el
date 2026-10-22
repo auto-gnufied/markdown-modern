@@ -57,6 +57,7 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'mwheel)
 
 ;; Load submodules
 (require 'markdown-modern-ts)
@@ -447,6 +448,33 @@ single source of truth shared between point-motion reveal and jit-lock.")
 (defvar-local markdown-modern--saved-margins nil
   "Original margins of windows changed by reading-width management.")
 
+;;; Mouse Wheel Scrolling
+
+(defun markdown-modern--wheel-scroll (function amount)
+  "Scroll with FUNCTION by AMOUNT, advancing past virtual table lines.
+Emacs can leave `window-start' unchanged when a one-line scroll ends
+inside a table overlay's before-string or multi-line display string.
+Retry a stalled one-line step once with two lines.  Preserve page scrolling
+when AMOUNT is nil and let buffer-boundary errors reach `mwheel-scroll'.
+Keep point at its screen position so redisplay does not recenter backward
+after scrolling through rendered text."
+  (let ((start (window-start))
+        (vscroll (window-vscroll nil t))
+        (scroll-preserve-screen-position 'always))
+    (funcall function amount)
+    (when (and (memq amount '(1 -1))
+               (= start (window-start))
+               (= vscroll (window-vscroll nil t)))
+      (funcall function (* 2 amount)))))
+
+(defun markdown-modern--wheel-up (&optional amount)
+  "Scroll forward by AMOUNT without stalling on virtual table lines."
+  (markdown-modern--wheel-scroll #'scroll-up amount))
+
+(defun markdown-modern--wheel-down (&optional amount)
+  "Scroll backward by AMOUNT without stalling on virtual table lines."
+  (markdown-modern--wheel-scroll #'scroll-down amount))
+
 ;;; Mode Definition
 
 (defvar markdown-modern-mode-map
@@ -566,6 +594,10 @@ single source of truth shared between point-motion reveal and jit-lock.")
   (when markdown-modern-variable-pitch
     (variable-pitch-mode 1))
 
+  ;; Keep wheel scrolling stable across virtual table lines and wrapped text.
+  (setq-local mwheel-scroll-up-function #'markdown-modern--wheel-up)
+  (setq-local mwheel-scroll-down-function #'markdown-modern--wheel-down)
+
   ;; Initialize rendering
   (markdown-modern-render--init)
   (markdown-modern--observe-buffer)
@@ -654,6 +686,12 @@ unaffected buffers and unchanged geometry require no overlay traversal."
     (unless markdown-modern--buffers
       (remove-hook 'window-state-change-functions #'markdown-modern--refresh-layout)
       (remove-hook 'after-delete-frame-functions #'markdown-modern--refresh-layout))
+
+    ;; Release only our callbacks; preserve any later user override.
+    (when (eq mwheel-scroll-up-function #'markdown-modern--wheel-up)
+      (kill-local-variable 'mwheel-scroll-up-function))
+    (when (eq mwheel-scroll-down-function #'markdown-modern--wheel-down)
+      (kill-local-variable 'mwheel-scroll-down-function))
 
     ;; Reset state
     (setq markdown-modern--revealed-region nil)

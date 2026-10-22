@@ -19,6 +19,10 @@ changes.
 
 ### Fixed
 
+- Mouse wheel scrolling no longer snaps back through previously viewed sections
+  of wrapped text. Stalled one-line steps over virtual table lines retry once,
+  and wheel callbacks support Emacs's zero-argument buffer-boundary recovery.
+
 - Delayed image downloads follow their original placeholder after edits and
   cannot overwrite a replacement image or a revealed element.
 - Display glyphs are buffer-local. Changing display capabilities invalidates
